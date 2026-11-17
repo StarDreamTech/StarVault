@@ -7,8 +7,9 @@ use std::{
     cell::RefCell,
     collections::{BTreeMap, BTreeSet},
     fs,
+    io::{BufRead, BufReader, Read},
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
     rc::Rc,
     sync::{mpsc, Arc, LazyLock, Mutex},
     thread,
@@ -17,10 +18,14 @@ use std::{
 
 mod attachments_view;
 mod brand;
+mod claude_projects_view;
 mod filters_view;
+mod imports_view;
 mod message_metadata;
+mod migration_view;
 #[cfg(test)]
 mod replies_view_tests;
+mod session_relations_view;
 #[cfg(test)]
 mod settings_view_tests;
 mod share;
@@ -61,6 +66,8 @@ struct SessionMeta {
     models: Vec<String>,
     labels: Vec<String>,
     coverage: String,
+    session_relations: Vec<session_relations_view::Relation>,
+    claude_project: Option<claude_projects_view::Project>,
     local_record: String,
     attachments: usize,
     operations: usize,
@@ -88,6 +95,13 @@ struct Catalog {
     timeline_stats: timeline::ScanStats,
 }
 
+struct TimelineResult {
+    revision: u64,
+    nodes: Vec<Vec<timeline::Node>>,
+    stats: timeline::ScanStats,
+    warnings: Vec<String>,
+}
+
 fn default_home() -> PathBuf {
     PathBuf::from(
         std::env::var_os("HOME")
@@ -107,6 +121,7 @@ fn app_home() -> PathBuf {
 #[derive(Default, Deserialize, Serialize)]
 #[serde(default)]
 struct Preferences {
+    workspace: migration_view::Workspace,
     archive: String,
     images: String,
     font_size: f32,
@@ -254,6 +269,7 @@ fn load_catalog(root: &Path) -> Result<Catalog, String> {
             if meta.id.is_empty() {
                 meta.id = id.to_string();
             }
+            claude_projects_view::hydrate_legacy(&root, &branch, &mut meta);
             let path = match entry.path().join(&meta.file).canonicalize() {
                 Ok(path)
                     if path.starts_with(&root)
@@ -320,6 +336,9 @@ struct Filters {
 
 impl Filters {
     fn matches(&self, session: &Session) -> bool {
+        if claude_projects_view::is_timeline_item(session) {
+            return false;
+        }
         let m = &session.meta;
         if !self.tool.is_empty() && self.tool != m.tool {
             return false;
@@ -416,6 +435,13 @@ struct MessageCard {
     context_image_count: usize,
     attachment_context: String,
     replies_expanded: bool,
+    project_thread: Option<String>,
+    project_links: Vec<claude_projects_view::Link>,
+}
+
+enum ReaderAction {
+    Image(PreviewImage),
+    Project(claude_projects_view::Jump),
 }
 
 fn separate_attachment_context(markdown: &str) -> (String, String) {
@@ -689,6 +715,8 @@ fn message_cards(markdown: &str) -> Vec<MessageCard> {
                 context_image_count: 0,
                 attachment_context: String::new(),
                 replies_expanded: false,
+                project_thread: None,
+                project_links: Vec::new(),
             });
             continue;
         }
@@ -718,6 +746,8 @@ fn message_cards(markdown: &str) -> Vec<MessageCard> {
                 context_image_count: 0,
                 attachment_context: String::new(),
                 replies_expanded: false,
+                project_thread: None,
+                project_links: Vec::new(),
             });
         }
         cards.last_mut().unwrap().markdown.push_str(line);
@@ -746,7 +776,10 @@ fn assistant_reply_groups(cards: &[MessageCard]) -> BTreeMap<usize, (usize, usiz
             continue;
         }
         let (mut end, mut latest, mut replies) = (start, start, 0);
-        while end < cards.len() && (cards[end].role == "助手" || cards[end].context.is_some()) {
+        while end < cards.len()
+            && (cards[end].role == "助手" || cards[end].context.is_some())
+            && cards[end].project_thread == cards[start].project_thread
+        {
             if cards[end].role == "助手" {
                 latest = end;
                 replies += 1;
@@ -769,8 +802,9 @@ fn show_message_cards(
     thumbnail_width: u32,
     focus_message: Option<usize>,
     scroll_target: &mut Option<usize>,
-) -> Option<PreviewImage> {
+) -> Option<ReaderAction> {
     let clicked = Rc::new(RefCell::new(None));
+    let mut project_jump = None;
     let reply_groups = assistant_reply_groups(cards);
     egui::ScrollArea::both()
         .id_salt("message-cards")
@@ -948,7 +982,11 @@ fn show_message_cards(
                                             });
                                             egui::Frame::new()
                                                 .fill(if user_message {
-                                                    Color32::from_rgb(243, 243, 245)
+                                                    if card.project_thread.is_some() {
+                                                        Color32::from_rgb(234, 241, 252)
+                                                    } else {
+                                                        Color32::from_rgb(243, 243, 245)
+                                                    }
                                                 } else {
                                                     Color32::TRANSPARENT
                                                 })
@@ -1001,6 +1039,23 @@ fn show_message_cards(
                                                         });
                                                 });
                                             }
+                                            for link in &card.project_links {
+                                                if ui
+                                                    .add_enabled(
+                                                        link.target.is_some(),
+                                                        egui::Button::new(
+                                                            RichText::new(&link.label)
+                                                                .size(12.0)
+                                                                .color(ACCENT),
+                                                        )
+                                                        .frame(false),
+                                                    )
+                                                    .on_hover_text(&link.hint)
+                                                    .clicked()
+                                                {
+                                                    project_jump = link.target;
+                                                }
+                                            }
                                         });
                                     });
                                 })
@@ -1021,8 +1076,9 @@ fn show_message_cards(
                 });
             });
         });
-    let selected = clicked.borrow_mut().take();
-    selected
+    project_jump
+        .map(ReaderAction::Project)
+        .or_else(|| clicked.borrow_mut().take().map(ReaderAction::Image))
 }
 
 fn show_message_body(
@@ -1078,6 +1134,17 @@ fn short_date(date: &str) -> String {
     DateTime::parse_from_rfc3339(date)
         .map(|d| d.with_timezone(&Local).format("%m-%d %H:%M").to_string())
         .unwrap_or_default()
+}
+
+fn open_folder(path: &Path) {
+    let program = if cfg!(target_os = "macos") {
+        "open"
+    } else if cfg!(target_os = "windows") {
+        "explorer"
+    } else {
+        "xdg-open"
+    };
+    let _ = Command::new(program).arg(path).spawn();
 }
 
 fn reveal(path: &Path) {
@@ -1138,7 +1205,36 @@ fn backup_tool() -> Result<PathBuf, String> {
         .and_then(|path| path.canonicalize().map_err(|error| error.to_string()))
 }
 
-fn run_backup_tool(args: &[String]) -> Result<serde_json::Value, String> {
+enum BackupEvent {
+    Progress(String),
+    Finished(Result<serde_json::Value, String>),
+}
+
+fn backup_progress(line: &str) -> Option<String> {
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(line) {
+        if value["progress"] == true {
+            return Some(format!(
+                "{}/{} · {} · {}",
+                value["completed_sources"].as_u64().unwrap_or(0) + 1,
+                value["total_sources"],
+                tool_name(value["tool"].as_str().unwrap_or("")),
+                if value["phase"] == "attachments" {
+                    "正在复制所选附件"
+                } else {
+                    "正在检查会话变化"
+                }
+            ));
+        }
+    }
+    let (tool, count) = line.split_once(": exported ")?;
+    Some(format!(
+        "{} · 已更新 {} 段会话",
+        tool_name(tool),
+        count.strip_suffix(" changed sessions")?
+    ))
+}
+
+fn run_backup_tool(args: &[String], progress: impl Fn(&str)) -> Result<serde_json::Value, String> {
     let script = backup_tool()?;
     let candidates: &[(&str, &[&str])] = if cfg!(target_os = "windows") {
         &[("py", &["-3"]), ("python", &[]), ("python3", &[])]
@@ -1150,50 +1246,85 @@ fn run_backup_tool(args: &[String]) -> Result<serde_json::Value, String> {
         ]
     };
     for &(python, prefix) in candidates {
-        let output = Command::new(python)
+        let child = Command::new(python)
             .env("PYTHONUTF8", "1")
             .env("PYTHONIOENCODING", "utf-8")
+            .env("PYTHONUNBUFFERED", "1")
             .args(prefix)
             .arg(&script)
             .args(args)
             .current_dir(script.parent().unwrap())
-            .output();
-        let output = match output {
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn();
+        let mut child = match child {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => return Err(format!("无法启动 {python}：{error}")),
-            Ok(output) => output,
+            Ok(child) => child,
         };
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let detail = if stderr.trim().is_empty() {
-                stdout
-            } else {
-                stderr
+        let mut stderr = child.stderr.take().unwrap();
+        let errors = thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let mut chunk = [0; 4096];
+            loop {
+                match stderr.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => bytes.extend_from_slice(
+                        &chunk[..n.min(12000_usize.saturating_sub(bytes.len()))],
+                    ),
+                }
+            }
+            String::from_utf8_lossy(&bytes).into_owned()
+        });
+        let mut value = None;
+        let mut last_line = String::new();
+        let mut read_error = None;
+        for line in BufReader::new(child.stdout.take().unwrap()).lines() {
+            let line = match line {
+                Ok(line) => line,
+                Err(error) => {
+                    read_error = Some(error.to_string());
+                    break;
+                }
             };
+            if backup_progress(&line).is_some() {
+                progress(&line);
+            } else if let Ok(json) = serde_json::from_str::<serde_json::Value>(&line) {
+                value = Some(json);
+            }
+            last_line = line.chars().take(3000).collect();
+        }
+        let status = child.wait().map_err(|e| e.to_string())?;
+        let stderr = errors.join().unwrap_or_default();
+        if !status.success() {
             return Err(format!(
-                "备份工具退出（{}）：{}",
-                output.status,
-                detail.chars().take(3000).collect::<String>()
+                "备份工具退出（{status}）：{}",
+                if stderr.trim().is_empty() {
+                    last_line
+                } else {
+                    stderr
+                }
             ));
         }
-        return String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .rev()
-            .find_map(|line| serde_json::from_str(line).ok())
-            .ok_or_else(|| "备份工具未返回结果".to_string());
+        if let Some(error) = read_error {
+            return Err(error);
+        }
+        return value.ok_or_else(|| "备份工具未返回结果".to_string());
     }
     Err("未找到 Python 3，请安装 Python 3 并将其加入 PATH。".into())
 }
 
-fn spawn_backup_job(
-    ctx: &egui::Context,
-    args: Vec<String>,
-) -> mpsc::Receiver<Result<serde_json::Value, String>> {
+fn spawn_backup_job(ctx: &egui::Context, args: Vec<String>) -> mpsc::Receiver<BackupEvent> {
     let (tx, rx) = mpsc::channel();
     let ctx = ctx.clone();
     thread::spawn(move || {
-        let _ = tx.send(run_backup_tool(&args));
+        let result = run_backup_tool(&args, |line| {
+            if let Some(message) = backup_progress(line) {
+                let _ = tx.send(BackupEvent::Progress(message));
+                ctx.request_repaint();
+            }
+        });
+        let _ = tx.send(BackupEvent::Finished(result));
         ctx.request_repaint();
     });
     rx
@@ -1344,13 +1475,16 @@ fn settings_layout(
 
 struct VaultApp {
     root: PathBuf,
-    catalog: Catalog,
+    catalog: Arc<Catalog>,
     filters: Filters,
     visible: Vec<usize>,
     selected: Option<usize>,
     cards: Vec<MessageCard>,
     cache: CommonMarkCache,
+    project_reader: claude_projects_view::Reader,
     receiver: Option<mpsc::Receiver<Result<Catalog, String>>>,
+    timeline_receiver: Option<mpsc::Receiver<TimelineResult>>,
+    catalog_revision: u64,
     prefs: Preferences,
     status: String,
     last_refresh: Instant,
@@ -1366,6 +1500,9 @@ struct VaultApp {
     capture_after: Option<Instant>,
     capture_requested: bool,
     show_resources: bool,
+    imports: imports_view::Panel,
+    transfer: migration_view::State,
+    job_is_transfer: bool,
     attachment_filters: attachments_view::Filters,
     attachment_files: Vec<attachments_view::Attachment>,
     manifest: serde_json::Value,
@@ -1373,7 +1510,7 @@ struct VaultApp {
     migrate_all: bool,
     migration_saved_kinds: BTreeSet<String>,
     migration_plan: Option<serde_json::Value>,
-    job_receiver: Option<mpsc::Receiver<Result<serde_json::Value, String>>>,
+    job_receiver: Option<mpsc::Receiver<BackupEvent>>,
     job_is_plan: bool,
     show_skills: bool,
     skill_sources: String,
@@ -1383,7 +1520,7 @@ struct VaultApp {
     skill_settings_loaded: bool,
     skill_report: Option<serde_json::Value>,
     skill_report_is_plan: bool,
-    skill_receiver: Option<mpsc::Receiver<Result<serde_json::Value, String>>>,
+    skill_receiver: Option<mpsc::Receiver<BackupEvent>>,
     skill_job: SkillJob,
     skill_status: String,
     skill_error: bool,
@@ -1424,14 +1561,20 @@ impl VaultApp {
             })
             .unwrap_or_else(|| ["images".to_string()].into_iter().collect());
         let mut app = Self {
+            imports: imports_view::Panel::load(&root),
+            transfer: migration_view::State::default(),
+            job_is_transfer: false,
             root,
             prefs,
-            catalog: Catalog::default(),
+            catalog: Arc::new(Catalog::default()),
+            timeline_receiver: None,
+            catalog_revision: 0,
             filters,
             visible: vec![],
             selected: None,
             cards: Vec::new(),
             cache: CommonMarkCache::default(),
+            project_reader: claude_projects_view::Reader::default(),
             receiver: None,
             status: "正在读取本地备份…".into(),
             last_refresh: Instant::now(),
@@ -1490,13 +1633,7 @@ impl VaultApp {
         self.receiver = Some(rx);
         self.last_refresh = Instant::now();
         thread::spawn(move || {
-            let result = load_catalog(&root).map(|mut catalog| {
-                let (nodes, stats, warnings) = timeline::refresh(&root, &catalog.sessions);
-                catalog.timelines = nodes;
-                catalog.timeline_stats = stats;
-                catalog.warnings.extend(warnings);
-                catalog
-            });
+            let result = load_catalog(&root);
             let _ = tx.send(result);
             context.request_repaint();
         });
@@ -1518,10 +1655,16 @@ impl VaultApp {
                         .selected
                         .and_then(|i| self.catalog.sessions.get(i))
                         .map(|s| (s.branch.clone(), s.meta.id.clone()));
-                    self.catalog = catalog;
+                    self.catalog = Arc::new(catalog);
+                    self.catalog_revision += 1;
+                    self.timeline_receiver = None;
                     self.status = format!(
                         "{} 个会话 · 本地读取 · {} 更新",
-                        self.catalog.sessions.len(),
+                        self.catalog
+                            .sessions
+                            .iter()
+                            .filter(|s| !claude_projects_view::is_timeline_item(s))
+                            .count(),
                         Local::now().format("%H:%M")
                     );
                     self.selected = key.as_ref().and_then(|(b, id)| {
@@ -1574,6 +1717,49 @@ impl VaultApp {
         }
     }
 
+    fn poll_timeline(&mut self, ctx: &egui::Context) {
+        if let Some(result) = self
+            .timeline_receiver
+            .as_ref()
+            .and_then(|rx| rx.try_recv().ok())
+        {
+            self.timeline_receiver = None;
+            if result.revision == self.catalog_revision {
+                // The worker drops its shared catalog before publishing the result.
+                if let Some(catalog) = Arc::get_mut(&mut self.catalog) {
+                    catalog.timelines = result.nodes;
+                    catalog.timeline_stats = result.stats;
+                    catalog.warnings.extend(result.warnings);
+                }
+            }
+        }
+        if self.prefs.workspace != migration_view::Workspace::Library
+            || !self.prefs.timeline_view
+            || self.receiver.is_some()
+            || self.timeline_receiver.is_some()
+            || self.catalog.timelines.len() == self.catalog.sessions.len()
+        {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        self.timeline_receiver = Some(rx);
+        let catalog = Arc::clone(&self.catalog);
+        let root = self.root.clone();
+        let revision = self.catalog_revision;
+        let context = ctx.clone();
+        thread::spawn(move || {
+            let (nodes, stats, warnings) = timeline::refresh(&root, &catalog.sessions);
+            drop(catalog);
+            let _ = tx.send(TimelineResult {
+                revision,
+                nodes,
+                stats,
+                warnings,
+            });
+            context.request_repaint();
+        });
+    }
+
     fn refilter(&mut self) {
         self.visible = self
             .catalog
@@ -1617,30 +1803,26 @@ impl VaultApp {
                     .count()
             })
             .unwrap_or(0);
-        self.cards = self
+        self.cards = self.selected.map(|i| self.cards_for(i)).unwrap_or_default();
+        if let Some(main) = self
             .selected
-            .map(|i| message_cards(body(&self.catalog.sessions[i].markdown)))
-            .unwrap_or_default();
-        if let Some(path) = self.selected.and_then(|i| self.local_record_path(i)) {
-            message_metadata::apply(&mut self.cards, &path);
-        }
-        for card in &mut self.cards {
-            if card.role == "助手" {
-                card.sender = self
-                    .selected
-                    .map(|i| tool_name(&self.catalog.sessions[i].meta.tool))
-                    .unwrap_or_else(|| "助手".into());
+            .and_then(|i| claude_projects_view::main(&self.catalog, i))
+        {
+            let key = project_identity(&self.catalog.sessions[main]);
+            if self.project_reader.key.as_ref() != Some(&key) {
+                self.project_reader = claude_projects_view::Reader::default();
+                self.project_reader.key = Some(key);
             }
-            (card.markdown, card.images) = thumbnail_markdown(&prepare_markdown(
-                &card.markdown,
-                &images,
-                self.prefs.text_only,
-            ));
+            self.project_reader.cards = self.cards_for(main);
+            self.project_reader.cache = CommonMarkCache::default();
+        } else {
+            self.project_reader = claude_projects_view::Reader::default();
         }
         if self.preview_image.as_ref().is_some_and(|preview| {
             !self
                 .cards
                 .iter()
+                .chain(&self.project_reader.cards)
                 .any(|card| card.images.iter().any(|image| image.uri == preview.uri))
         }) {
             self.preview_image = None;
@@ -1648,19 +1830,84 @@ impl VaultApp {
         }
     }
 
+    fn cards_for(&self, index: usize) -> Vec<MessageCard> {
+        let mut cards = message_cards(body(&self.catalog.sessions[index].markdown));
+        if let Some(path) = self.local_record_path(index) {
+            message_metadata::apply(&mut cards, &path);
+        }
+        claude_projects_view::attach_links(&self.catalog, index, &mut cards);
+        let images = image_directory(&self.root, &self.prefs.images);
+        for card in &mut cards {
+            if card.role == "助手" {
+                card.sender = tool_name(&self.catalog.sessions[index].meta.tool);
+            }
+            (card.markdown, card.images) = thumbnail_markdown(&prepare_markdown(
+                &card.markdown,
+                &images,
+                self.prefs.text_only,
+            ));
+        }
+        cards
+    }
+
     fn choose_archive(&mut self, ctx: &egui::Context) {
         if let Some(path) = rfd::FileDialog::new()
+            .set_title("选择从旧电脑带来的 StarVault 档案文件夹")
             .set_directory(&self.root)
             .pick_folder()
         {
+            let has_index = fs::read_dir(&path).ok().is_some_and(|entries| {
+                entries.flatten().any(|entry| {
+                    let name = entry.file_name();
+                    let name = name.to_string_lossy();
+                    !name.starts_with('.')
+                        && !matches!(
+                            name.as_ref(),
+                            "images" | "attachments" | "records" | "skills"
+                        )
+                        && entry.path().join("index.json").is_file()
+                })
+            });
+            if !has_index {
+                self.status =
+                    "这个文件夹中没有找到星匣聊天档案，请选择带来的 StarVault 档案文件夹本身。"
+                        .into();
+                self.transfer.message = self.status.clone();
+                return;
+            }
             // Discard a refresh for the previous archive before starting this one.
             self.receiver = None;
             self.root = path;
+            self.imports = imports_view::Panel::load(&self.root);
+            self.transfer = migration_view::State::default();
+            self.prefs.workspace = migration_view::Workspace::Library;
+            self.prefs.images.clear();
+            self.images_input.clear();
             self.selected = None;
             self.filters = Filters::default();
-            self.catalog = Catalog::default();
+            self.catalog = Arc::new(Catalog::default());
+            self.catalog_revision += 1;
+            self.timeline_receiver = None;
             self.visible.clear();
             self.cards.clear();
+            self.project_reader = claude_projects_view::Reader::default();
+            self.manifest = serde_json::Value::Null;
+            self.attachment_files.clear();
+            self.migration_plan = None;
+            self.migration_kinds = fs::read_to_string(self.root.join(".migration.json"))
+                .ok()
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                .and_then(|v| {
+                    v["kinds"].as_array().map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
+                    })
+                })
+                .unwrap_or_default();
+            self.migration_saved_kinds = self.migration_kinds.clone();
+            self.preview_image = None;
+            self.preview_zoom = None;
             self.skill_report = None;
             self.skill_settings_loaded = false;
             self.skill_sources.clear();
@@ -1669,6 +1916,7 @@ impl VaultApp {
             self.remembered_skills = false;
             self.skill_status.clear();
             self.skill_error = false;
+            self.status = "正在打开档案…".into();
             self.save_preferences();
             self.reload(ctx);
             if self.show_skills {
@@ -1698,7 +1946,22 @@ impl VaultApp {
         }
     }
 
+    fn open_project(&mut self, ctx: &egui::Context, jump: claude_projects_view::Jump) {
+        self.selected = Some(jump.session);
+        self.prefs.projects_view = true;
+        self.render_selected(ctx);
+        self.focus_message = jump.message;
+        self.scroll_target = jump.message;
+    }
+
     fn project_timeline(&mut self, ui: &mut egui::Ui, selected: usize) -> Option<(usize, usize)> {
+        if self.catalog.timelines.len() != self.catalog.sessions.len() {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("正在整理项目时间线，可切回聊天继续阅读…");
+            });
+            return None;
+        }
         let session = &self.catalog.sessions[selected];
         let identity = project_identity(session);
         let rows: Vec<usize> = self
@@ -1707,7 +1970,7 @@ impl VaultApp {
             .copied()
             .filter(|&i| project_identity(&self.catalog.sessions[i]) == identity)
             .collect();
-        let total: usize = rows.iter().map(|&i| self.catalog.timelines[i].len()).sum();
+        let total = timeline_entries(&self.catalog, &rows, "", false).len();
         ui.label(RichText::new("项目时间线").small().color(ACCENT));
         ui.add(
             egui::Label::new(RichText::new(&session.meta.project).size(25.0).strong()).truncate(),
@@ -1718,7 +1981,7 @@ impl VaultApp {
                 RichText::new(format!(
                     "{} · {} · {}",
                     session.device,
-                    session.meta.tool.to_uppercase(),
+                    tool_name(&session.meta.tool),
                     session.meta.cwd
                 ))
                 .small()
@@ -2130,30 +2393,204 @@ impl VaultApp {
         (path.starts_with(root.join("records")) && path.is_file()).then_some(path)
     }
 
+    fn import_chatgpt(&mut self, ctx: &egui::Context) {
+        if let Some(path) = rfd::FileDialog::new()
+            .set_title("选择已有的 ChatGPT 导出文件")
+            .add_filter("ChatGPT 导出文件", &["json", "zip"])
+            .pick_file()
+        {
+            self.start_job(
+                ctx,
+                vec![
+                    "import-chatgpt".into(),
+                    path.to_string_lossy().into(),
+                    "--archive".into(),
+                    self.root.to_string_lossy().into(),
+                ],
+                false,
+            );
+        }
+    }
+
+    fn migration_action(&mut self, ctx: &egui::Context, action: migration_view::Action) {
+        use migration_view::{Action, Workspace};
+        match action {
+            Action::Collect | Action::Storage => {
+                self.imports.open = true;
+                self.imports.storage = action == Action::Storage;
+            }
+            Action::Check => self.start_job(
+                ctx,
+                vec![
+                    "transfer-archive".into(),
+                    "--archive".into(),
+                    self.root.to_string_lossy().into(),
+                    "--plan".into(),
+                ],
+                false,
+            ),
+            Action::Export => {
+                if let Some(path) = rfd::FileDialog::new()
+                    .set_title("选择保存位置，将在其中新建 StarVault 档案文件夹")
+                    .pick_folder()
+                {
+                    self.start_job(
+                        ctx,
+                        vec![
+                            "transfer-archive".into(),
+                            "--archive".into(),
+                            self.root.to_string_lossy().into(),
+                            "--destination".into(),
+                            path.to_string_lossy().into(),
+                        ],
+                        false,
+                    );
+                }
+            }
+            Action::Open => self.choose_archive(ctx),
+            Action::Library => {
+                self.prefs.workspace = Workspace::Library;
+                self.save_preferences();
+            }
+            Action::Reveal => open_folder(&self.root),
+            Action::RevealExport => {
+                if let Some(path) = self
+                    .transfer
+                    .report
+                    .as_ref()
+                    .and_then(|r| r["destination"].as_str())
+                {
+                    open_folder(Path::new(path));
+                }
+            }
+            Action::Resources => self.show_resources = true,
+            Action::Skills => {
+                self.show_skills = true;
+                if self.skill_report.is_none() && self.skill_receiver.is_none() {
+                    self.start_skill_job(ctx, SkillJob::List, vec![]);
+                }
+            }
+        }
+    }
+
+    fn dialogs(&mut self, ctx: &egui::Context) {
+        if self.show_settings {
+            self.image_settings(ctx);
+        }
+        if self.show_resources {
+            self.resource_window(ctx);
+        }
+        if self.imports.open {
+            match self.imports.show(
+                ctx,
+                &self.root,
+                &self.catalog,
+                self.job_receiver.is_some() || self.skill_receiver.is_some(),
+                &self.status,
+            ) {
+                Some(imports_view::Action::Run(args)) => self.start_job(ctx, args, false),
+                Some(imports_view::Action::ImportChatgpt) => self.import_chatgpt(ctx),
+                None => {}
+            }
+        }
+        if self.show_skills {
+            self.skills_window(ctx);
+        }
+        self.image_preview(ctx);
+    }
+
     fn start_job(&mut self, ctx: &egui::Context, args: Vec<String>, plan: bool) {
         if self.job_receiver.is_some() {
             return;
         }
+        self.job_is_transfer = args.first().is_some_and(|a| a == "transfer-archive");
+        self.imports.started = Some(Instant::now());
         self.job_receiver = Some(spawn_backup_job(ctx, args));
         self.job_is_plan = plan;
-        self.status = if plan {
+        self.status = if self.job_is_transfer {
+            "正在准备迁移档案，完成后会显示保存位置…"
+        } else if plan {
             "正在估算本地迁移空间…"
         } else {
             "正在处理本地备份，窗口仍可浏览…"
         }
         .into();
+        if self.job_is_transfer {
+            self.transfer.message = self.status.clone();
+        } else {
+            self.transfer.report = None;
+        }
+        if self.imports.open {
+            self.imports.message = Some(self.status.clone());
+        }
     }
 
     fn poll_job(&mut self, ctx: &egui::Context) {
-        if let Some(result) = self.job_receiver.as_ref().and_then(|rx| rx.try_recv().ok()) {
+        let event = self.job_receiver.as_ref().and_then(|rx| rx.try_recv().ok());
+        if let Some(BackupEvent::Progress(message)) = &event {
+            self.status = message.clone();
+            self.imports.message = Some(message.clone());
+            ctx.request_repaint();
+        }
+        if let Some(BackupEvent::Finished(result)) = event {
             self.job_receiver = None;
+            self.imports.started = None;
             match result {
                 Ok(value) => {
-                    if self.job_is_plan {
+                    if value["transfer_archive"] == true {
+                        self.status = if value["plan"] == true {
+                            "档案检查完成，选择保存位置后再导出。".into()
+                        } else {
+                            "已导出独立档案文件夹，可拷到新电脑后在星匣中打开。".into()
+                        };
+                        self.transfer.message = self.status.clone();
+                        self.transfer.report = Some(value);
+                        return;
+                    }
+                    let import_task =
+                        value["cleanup_text"] == true || value["imported_local"] == true;
+                    if value["cleanup_text"] == true && value["plan"] == true {
+                        self.imports.cleanup_plan = Some(value);
+                        self.status = "空间估算完成，尚未清理文件。".into();
+                    } else if self.job_is_plan {
                         self.migration_plan = Some(value);
                         self.status = "空间估算完成".into();
                     } else {
-                        self.status = if value["settings_only"] == true {
+                        self.status = if value["cleanup_text"] == true {
+                            let storage = self.imports.storage;
+                            self.imports = imports_view::Panel::load(&self.root);
+                            self.imports.open = true;
+                            self.imports.storage = storage;
+                            self.migration_kinds.clear();
+                            self.migration_saved_kinds.clear();
+                            self.migration_plan = None;
+                            format!(
+                                "已释放 {:.2} GB，归档文字保留，原应用文件未改动。",
+                                value["removed_bytes"].as_u64().unwrap_or(0) as f64 / 1e9
+                            )
+                        } else if value["imported_local"] == true {
+                            let storage = self.imports.storage;
+                            let open = self.imports.open;
+                            self.imports = imports_view::Panel::load(&self.root);
+                            self.imports.storage = storage;
+                            self.imports.open = open;
+                            self.migration_kinds = value["kinds"]
+                                .as_array()
+                                .into_iter()
+                                .flatten()
+                                .filter_map(|v| v.as_str().map(String::from))
+                                .collect();
+                            self.migration_saved_kinds = self.migration_kinds.clone();
+                            format!(
+                                "收集完成：{} 个会话有更新 · {}",
+                                value["changed_sessions"],
+                                if value["text_only"] == true {
+                                    "仅保存文本"
+                                } else {
+                                    "文字与所选附件"
+                                }
+                            )
+                        } else if value["settings_only"] == true {
                             self.migration_saved_kinds = value["kinds"]
                                 .as_array()
                                 .into_iter()
@@ -2162,7 +2599,7 @@ impl VaultApp {
                                 .collect();
                             "已保存后续备份偏好，现有附件保留。".into()
                         } else if let Some(n) = value.get("imported_chatgpt") {
-                            format!("已导入 {n} 个 ChatGPT 会话，下次同步上传对话文字。")
+                            format!("已将 {n} 个 ChatGPT 会话保存到当前档案。")
                         } else {
                             format!(
                                 "本地迁移完成：复制 {} 个文件，{} 项路径引用未找到本地文件。",
@@ -2172,8 +2609,20 @@ impl VaultApp {
                         self.render_selected(ctx);
                         self.reload(ctx);
                     }
+                    if import_task {
+                        self.imports.message = Some(self.status.clone());
+                    }
                 }
-                Err(error) => self.status = format!("操作未完成：{error}"),
+                Err(error) => {
+                    self.status = format!("操作未完成：{error}");
+                    if self.job_is_transfer {
+                        self.transfer.message = self.status.clone();
+                        self.transfer.report = None;
+                    }
+                    if self.imports.open {
+                        self.imports.message = Some(self.status.clone());
+                    }
+                }
             }
         }
     }
@@ -2237,6 +2686,13 @@ impl VaultApp {
             .and_then(|rx| rx.try_recv().ok())
         else {
             return;
+        };
+        let result = match result {
+            BackupEvent::Progress(message) => {
+                self.skill_status = message;
+                return;
+            }
+            BackupEvent::Finished(result) => result,
         };
         self.skill_receiver = None;
         match result {
@@ -2483,7 +2939,7 @@ impl VaultApp {
                         if ui.add_enabled(self.job_receiver.is_none(), egui::Button::new("保存后续备份偏好")).clicked() { save_policy = true; }
                         ui.label(RichText::new(if self.migration_kinds == self.migration_saved_kinds { "已与备份偏好一致" } else { "有未保存的选择" }).small().color(MUTED));
                     });
-                    ui.label(RichText::new("保存偏好只影响后续备份，已有副本保留。原始会话快照可能包含内嵌资源。").small().color(MUTED));
+                    ui.label(RichText::new("保存偏好只影响后续备份，已有副本保留。仅文本导入模式不自动复制附件；可在“增量导入”调整。").small().color(MUTED));
                 });
                 if let Some(plan) = &self.migration_plan {
                     let needed = plan["estimated_bytes"].as_u64().unwrap_or(0) as f64 / 1048576.0;
@@ -2579,6 +3035,23 @@ impl VaultApp {
 }
 
 fn project_identity(s: &Session) -> (String, String, String) {
+    if claude_projects_view::is_project(s) {
+        if let Some(project) = &s.meta.claude_project {
+            return (
+                s.branch.clone(),
+                "claude-project".into(),
+                format!("{}:{}", project.product, project.channel_id),
+            );
+        }
+        return (
+            s.branch.clone(),
+            "claude-project-legacy".into(),
+            s.meta
+                .project_id
+                .clone()
+                .unwrap_or_else(|| s.meta.project.clone()),
+        );
+    }
     let (kind, key) = if let Some(id) = s
         .meta
         .project_id
@@ -2625,13 +3098,47 @@ fn timeline_entries(
     let mut entries: Vec<_> = rows
         .iter()
         .flat_map(|&i| {
-            catalog.timelines[i]
-                .iter()
+            catalog
+                .timelines
+                .get(i)
+                .into_iter()
+                .flatten()
                 .enumerate()
                 .filter(move |(_, node)| kind.is_empty() || node.kind == kind)
                 .map(move |(j, _)| (i, j))
         })
         .collect();
+    // A Projects root is present in both the main dialogue and its discussion.
+    // Prefer the discussion's original message, but preserve main-only results
+    // when the current filters exclude that discussion.
+    let thread_messages: BTreeSet<_> = entries
+        .iter()
+        .filter_map(|&(i, j)| {
+            let s = &catalog.sessions[i];
+            let p = s.meta.claude_project.as_ref()?;
+            if p.view != "thread" {
+                return None;
+            }
+            let node = &catalog.timelines[i][j];
+            let message = p.messages.get(node.message_index)?;
+            Some((project_identity(s), message.id.clone(), node.kind.clone()))
+        })
+        .collect();
+    entries.retain(|&(i, j)| {
+        let s = &catalog.sessions[i];
+        if !claude_projects_view::is_main(s) {
+            return true;
+        }
+        let node = &catalog.timelines[i][j];
+        let message = s
+            .meta
+            .claude_project
+            .as_ref()
+            .and_then(|p| p.messages.get(node.message_index));
+        !message.is_some_and(|m| {
+            thread_messages.contains(&(project_identity(s), m.id.clone(), node.kind.clone()))
+        })
+    });
     entries.sort_by(|&(a, x), &(b, y)| {
         let left = &catalog.timelines[a][x];
         let right = &catalog.timelines[b][y];
@@ -2693,7 +3200,7 @@ fn timeline_project_button(
     let details = format!(
         "{} · {} · {nodes} 节点 / {sessions} 会话",
         s.device,
-        s.meta.tool.to_uppercase()
+        tool_name(&s.meta.tool)
     );
     for (text, y, size, color) in [
         (
@@ -2796,7 +3303,17 @@ fn session_button(ui: &mut egui::Ui, s: &Session, selected: bool, compact: bool)
     let galley = ui.painter().layout_job(job);
     ui.painter()
         .galley(rect.min + egui::vec2(12.0, 7.0), galley, INK);
-    let tool = tool_name(&s.meta.tool);
+    let tool = if claude_projects_view::is_main(s) {
+        "主对话".into()
+    } else if let Some(project) = &s.meta.claude_project {
+        format!("讨论串 · {}", claude_projects_view::status(&project.status))
+    } else if s.meta.tool == "claude-desktop" {
+        source_name(&s.meta.source)
+    } else if s.meta.source == "subagent" {
+        format!("{} · 子 Agent", tool_name(&s.meta.tool))
+    } else {
+        tool_name(&s.meta.tool)
+    };
     let detail = format!(
         "{}  ·  {}{}{}",
         short_date(&s.meta.updated_at),
@@ -2833,14 +3350,28 @@ fn session_button(ui: &mut egui::Ui, s: &Session, selected: bool, compact: bool)
 fn tool_name(value: &str) -> String {
     match value {
         "codex" => "Codex".to_owned(),
-        "claude" => "Claude".to_owned(),
-        "claude-desktop" => "Claude Desktop".to_owned(),
+        "claude" => "Claude Code".to_owned(),
+        "claude-desktop" => "Claude App".to_owned(),
         "chatgpt" => "ChatGPT".to_owned(),
         "openclaw" => "OpenClaw".to_owned(),
         "workbuddy" => "WorkBuddy".to_owned(),
         "dsh" => "DeepSeek Harness".to_owned(),
         other => other.to_owned(),
     }
+}
+
+fn source_name(value: &str) -> String {
+    match value {
+        "subagent" => "子 Agent 会话",
+        "user" => "用户会话",
+        "code-projects-cache" => "Projects · 主对话与讨论串",
+        "claude-ai-chat" => "普通聊天 · App 本地副本",
+        "sibling-1p-code" => "Claude Code · App 导入副本",
+        "terminal-cli" => "终端会话 · App 导入副本",
+        "local-desktop" => "App 本地会话",
+        _ => value,
+    }
+    .into()
 }
 
 fn filter_combo(
@@ -2857,12 +3388,20 @@ fn filter_combo(
         .selected_text(if value.is_empty() {
             "全部".to_owned()
         } else {
-            value.clone()
+            if label == "会话类型" {
+                source_name(value)
+            } else {
+                value.clone()
+            }
         })
         .show_ui(ui, |ui| {
             changed |= ui.selectable_value(value, String::new(), "全部").changed();
             for option in options.into_iter().filter(|option| !option.is_empty()) {
-                let text = option.clone();
+                let text = if label == "会话类型" {
+                    source_name(&option)
+                } else {
+                    option.clone()
+                };
                 changed |= ui.selectable_value(value, option, text).changed();
             }
         })
@@ -2878,6 +3417,7 @@ fn filter_combo(
 impl eframe::App for VaultApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll(ctx);
+        self.poll_timeline(ctx);
         self.poll_job(ctx);
         self.poll_skill_job();
         if let Some(path) = &self.screenshot {
@@ -2906,41 +3446,38 @@ impl eframe::App for VaultApp {
         }
         ctx.request_repaint_after(Duration::from_secs(30));
         if ctx.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::K)) {
+            self.prefs.workspace = migration_view::Workspace::Library;
             ctx.memory_mut(|memory| memory.request_focus(egui::Id::new("archive-search")));
         }
         egui::TopBottomPanel::top("toolbar")
             .frame(
                 egui::Frame::new()
-                    .fill(PAPER)
-                    .inner_margin(egui::Margin::symmetric(20, 8)),
+                    .fill(Color32::WHITE)
+                    .inner_margin(egui::Margin::symmetric(20, 10)),
             )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     brand::mark(ui, 26.0);
                     ui.label(RichText::new("星匣 · StarVault").size(14.0).strong());
+                    ui.add_space(20.0);
+                    if migration_view::navigation(ui, &mut self.prefs.workspace) {
+                        self.save_preferences();
+                    }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        brand::github_link(ui);
-                        ui.menu_button("管理", |ui| {
-                            ui.visuals_mut().widgets.inactive.bg_stroke = egui::Stroke::NONE;
-                            ui.set_min_width(170.0);
-                            ui.label(RichText::new("资料与设置").small().color(MUTED));
-                            if ui.button("附件与迁移").clicked() {
-                                self.show_resources = true;
-                                ui.close_menu();
-                            }
-                            if ui.button("Skill 备份与恢复").clicked() {
-                                self.show_skills = true;
-                                if self.skill_report.is_none() && self.skill_receiver.is_none() {
-                                    self.start_skill_job(ctx, SkillJob::List, vec![]);
-                                }
-                                ui.close_menu();
-                            }
-                            if ui.button("设置…").clicked() {
+                        ui.menu_button("设置与帮助", |ui| {
+                            ui.set_min_width(180.0);
+                            if ui.button("图片显示设置…").clicked() {
                                 self.images_input = self.prefs.images.clone();
+                                self.settings_tab = SettingsTab::Images;
                                 self.show_settings = true;
                                 ui.close_menu();
                             }
-                            if ui.button("分享软件").clicked() {
+                            if ui.button("存储空间…").clicked() {
+                                self.imports.open = true;
+                                self.imports.storage = true;
+                                ui.close_menu();
+                            }
+                            if ui.button("分享星匣").clicked() {
                                 self.settings_tab = SettingsTab::Share;
                                 self.show_settings = true;
                                 ui.close_menu();
@@ -2951,53 +3488,25 @@ impl eframe::App for VaultApp {
                                 ui.close_menu();
                             }
                             ui.separator();
+                            ui.horizontal(|ui| {
+                                brand::github_link(ui);
+                                ui.label("查看软件源码");
+                            });
+                        });
+                        if self.prefs.workspace == migration_view::Workspace::Library {
                             if ui
                                 .add_enabled(
-                                    self.receiver.is_none()
-                                        && self.job_receiver.is_none()
-                                        && self.skill_receiver.is_none(),
-                                    egui::Button::new("选择备份目录…"),
+                                    self.job_receiver.is_none() && self.skill_receiver.is_none(),
+                                    egui::Button::new(
+                                        RichText::new("增量导入").color(Color32::WHITE),
+                                    )
+                                    .fill(ACCENT),
                                 )
                                 .clicked()
                             {
-                                ui.close_menu();
-                                self.choose_archive(ctx);
+                                self.imports.open = true;
+                                self.imports.storage = false;
                             }
-                        });
-                        if ui
-                            .add_enabled(
-                                self.job_receiver.is_none(),
-                                egui::Button::new("导入 ChatGPT").frame(false),
-                            )
-                            .clicked()
-                        {
-                            if let Some(path) = rfd::FileDialog::new()
-                                .add_filter("ChatGPT 导出文件", &["json", "zip"])
-                                .pick_file()
-                            {
-                                self.start_job(
-                                    ctx,
-                                    vec![
-                                        "import-chatgpt".into(),
-                                        path.to_string_lossy().to_string(),
-                                        "--archive".into(),
-                                        self.root.to_string_lossy().to_string(),
-                                    ],
-                                    false,
-                                );
-                            }
-                        }
-                        if ui
-                            .add_enabled(
-                                self.receiver.is_none(),
-                                egui::Button::new("刷新").frame(false),
-                            )
-                            .clicked()
-                        {
-                            self.reload(ctx);
-                        }
-                        if self.receiver.is_some() {
-                            ui.spinner();
                         }
                     });
                 });
@@ -3032,6 +3541,28 @@ impl eframe::App for VaultApp {
                     });
                 });
             });
+        if self.prefs.workspace == migration_view::Workspace::Transfer {
+            let busy = self.job_receiver.is_some()
+                || self.skill_receiver.is_some()
+                || self.receiver.is_some();
+            let mut action = None;
+            egui::CentralPanel::default()
+                .frame(egui::Frame::new().fill(PAPER).inner_margin(28))
+                .show(ctx, |ui| {
+                    action = self.transfer.show(
+                        ui,
+                        &self.root,
+                        &self.catalog,
+                        busy,
+                        self.receiver.is_some(),
+                    );
+                });
+            if let Some(action) = action {
+                self.migration_action(ctx, action);
+            }
+            self.dialogs(ctx);
+            return;
+        }
         if filters_view::show(ctx, &mut self.filters, &self.catalog) {
             self.apply_filters(ctx);
         }
@@ -3050,14 +3581,15 @@ impl eframe::App for VaultApp {
                         if ui
                             .add_sized(
                                 [ui.available_width(), 32.0],
-                                egui::Button::new("打开备份文件夹").frame(false),
+                                egui::Button::new("备份与迁移 →").frame(false),
                             )
                             .on_hover_text(self.root.display().to_string())
                             .clicked()
                         {
-                            reveal(&self.root.join("README.md"));
+                            self.prefs.workspace = migration_view::Workspace::Transfer;
+                            self.save_preferences();
                         }
-                        ui.label(RichText::new("本地档案 · 每分钟更新").small().color(MUTED));
+                        ui.label(RichText::new("已收集的本地档案").small().color(MUTED));
                     });
                 ui.horizontal(|ui| {
                     ui.label(
@@ -3070,11 +3602,21 @@ impl eframe::App for VaultApp {
                         .strong(),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add_enabled(
+                                self.receiver.is_none(),
+                                egui::Button::new("↻").frame(false),
+                            )
+                            .on_hover_text("重新读取档案；收集新记录请点“收集本机记录”")
+                            .clicked()
+                        {
+                            self.reload(ctx);
+                        }
                         ui.label(
                             RichText::new(if cfg!(target_os = "macos") {
-                                "⌘ K 搜索"
+                                "⌘ K"
                             } else {
-                                "Ctrl K 搜索"
+                                "Ctrl K"
                             })
                             .small()
                             .color(MUTED),
@@ -3094,7 +3636,7 @@ impl eframe::App for VaultApp {
                     let mut view_changed = false;
                     for (projects, timeline, label) in [
                         (false, false, "最近"),
-                        (true, false, "项目分组"),
+                        (true, false, "按项目"),
                         (true, true, "时间线"),
                     ] {
                         if ui
@@ -3172,8 +3714,7 @@ impl eframe::App for VaultApp {
                         .show(ui, |ui| {
                             for (_, rows) in project_groups(&self.catalog, &self.visible) {
                                 let first = &self.catalog.sessions[rows[0]];
-                                let count: usize =
-                                    rows.iter().map(|&i| self.catalog.timelines[i].len()).sum();
+                                let count = timeline_entries(&self.catalog, &rows, "", false).len();
                                 let selected = self.selected.is_some_and(|i| rows.contains(&i));
                                 if timeline_project_button(ui, first, rows.len(), count, selected) {
                                     clicked = Some(rows[0]);
@@ -3184,9 +3725,40 @@ impl eframe::App for VaultApp {
                     egui::ScrollArea::vertical()
                         .id_salt("project-list")
                         .show(ui, |ui| {
-                            let groups = project_groups(&self.catalog, &self.visible);
+                            let mut groups = project_groups(&self.catalog, &self.visible);
+                            groups.sort_by_key(|(_, rows)| {
+                                !claude_projects_view::is_project(&self.catalog.sessions[rows[0]])
+                            });
+                            let mut previous_kind = None;
                             for (key, rows) in groups {
                                 let first = &self.catalog.sessions[rows[0]];
+                                let is_project = claude_projects_view::is_project(first);
+                                if previous_kind != Some(is_project)
+                                    && (is_project || previous_kind == Some(true))
+                                {
+                                    ui.add_space(8.0);
+                                    ui.label(
+                                        RichText::new(if is_project {
+                                            "Claude App · Projects"
+                                        } else {
+                                            "其他项目与会话"
+                                        })
+                                        .small()
+                                        .color(MUTED),
+                                    );
+                                }
+                                previous_kind = Some(is_project);
+                                if is_project {
+                                    if let Some(i) = claude_projects_view::group(
+                                        ui,
+                                        &self.catalog,
+                                        &rows,
+                                        self.selected,
+                                    ) {
+                                        clicked = Some(i);
+                                    }
+                                    continue;
+                                }
                                 let label = format!(
                                     "{}{} · {}",
                                     if first.meta.project_pinned {
@@ -3219,7 +3791,7 @@ impl eframe::App for VaultApp {
                                             RichText::new(format!(
                                                 "{} · {}",
                                                 first.device,
-                                                first.meta.tool.to_uppercase()
+                                                tool_name(&first.meta.tool)
                                             ))
                                             .small()
                                             .color(MUTED),
@@ -3240,11 +3812,29 @@ impl eframe::App for VaultApp {
                             }
                         });
                 } else {
+                    let recent = claude_projects_view::recent(&self.catalog, &self.visible);
                     egui::ScrollArea::vertical()
                         .id_salt("session-list")
-                        .show_rows(ui, SESSION_ROW_HEIGHT, self.visible.len(), |ui, range| {
+                        .show_rows(ui, SESSION_ROW_HEIGHT, recent.len(), |ui, range| {
                             for row in range {
-                                let i = self.visible[row];
+                                let i = recent[row];
+                                if claude_projects_view::is_project(&self.catalog.sessions[i]) {
+                                    if claude_projects_view::channel_button(
+                                        ui,
+                                        &self.catalog,
+                                        i,
+                                        self.selected,
+                                    ) {
+                                        clicked = Some(if self.filters.query.is_empty() {
+                                            claude_projects_view::main(&self.catalog, i)
+                                                .unwrap_or(i)
+                                        } else {
+                                            i
+                                        });
+                                        self.prefs.projects_view = true;
+                                    }
+                                    continue;
+                                }
                                 if session_button(
                                     ui,
                                     &self.catalog.sessions[i],
@@ -3283,19 +3873,20 @@ impl eframe::App for VaultApp {
                                 self.apply_filters(ctx);
                             }
                         } else {
-                            ui.heading("把灵感，收藏进星匣");
+                            ui.heading("先把聊天记录收集进来");
                             ui.label(
-                                RichText::new("选择备份目录，开始阅读你的 AI 对话。").color(MUTED),
+                                RichText::new("在“备份与迁移”中收集这台电脑，或打开带来的档案。").color(MUTED),
                             );
                             ui.add_space(12.0);
                             if ui
                                 .add_enabled(
                                     self.job_receiver.is_none() && self.skill_receiver.is_none(),
-                                    egui::Button::new("选择备份目录…"),
+                                    egui::Button::new("前往备份与迁移"),
                                 )
                                 .clicked()
                             {
-                                self.choose_archive(ctx);
+                                self.prefs.workspace = migration_view::Workspace::Transfer;
+                                self.save_preferences();
                             }
                         }
                     });
@@ -3310,6 +3901,10 @@ impl eframe::App for VaultApp {
                         self.scroll_target = Some(message);
                         self.save_preferences();
                     }
+                    return;
+                }
+                if claude_projects_view::is_project(&self.catalog.sessions[i]) {
+                    self.claude_project_reader(ui, ctx, i);
                     return;
                 }
                 let s = &self.catalog.sessions[i];
@@ -3330,11 +3925,7 @@ impl eframe::App for VaultApp {
                 let mut open_timeline = false;
                 ui.horizontal_wrapped(|ui| {
                     if ui
-                        .add(egui::Button::new(if self.focus_message.is_some() {
-                            "← 返回项目时间线"
-                        } else {
-                            "项目时间线"
-                        }).frame(false))
+                        .add(egui::Button::new("项目时间线").frame(false))
                         .clicked()
                     {
                         self.prefs.timeline_view = true;
@@ -3435,11 +4026,20 @@ impl eframe::App for VaultApp {
                 }
                 if s.meta.coverage == "partial_cache" {
                     ui.label(
-                        RichText::new("Claude Code Projects · 本地缓存，可能不完整；已备份消息持续保留，附件仅保留现有引用")
+                        RichText::new("Claude App Projects · 本地缓存可能不完整；状态为最后观察值，附件仅保留现有引用")
                             .small()
                             .color(MUTED),
                     );
                 }
+                if let Some(target) = session_relations_view::show(ui, &self.catalog, i) {
+                    self.selected = Some(target);
+                    self.render_selected(ctx);
+                    return;
+                }
+                if !self.visible.contains(&i) {
+                    ui.label(RichText::new("此关联会话不在当前筛选结果中").small().color(MUTED));
+                }
+                let empty_project_main = claude_projects_view::is_main(s) && s.meta.messages == 0;
                 ui.separator();
                 if open_timeline {
                     self.save_preferences();
@@ -3449,30 +4049,31 @@ impl eframe::App for VaultApp {
                     self.render_selected(ctx);
                     self.save_preferences();
                 }
-                ui.push_id(format!("conversation-{i}-{}", self.prefs.text_only), |ui| {
-                    if let Some(image) = show_message_cards(
+                if empty_project_main {
+                    ui.add_space(28.0);
+                    ui.label("主对话当前没有已缓存正文，可在左侧查看已保存的讨论串。");
+                    return;
+                }
+                let action = ui.push_id(format!("conversation-{i}-{}", self.prefs.text_only), |ui| {
+                    show_message_cards(
                         ui,
                         &mut self.cards,
                         &mut self.cache,
                         self.prefs.thumbnail_width,
                         self.focus_message,
                         &mut self.scroll_target,
-                    ) {
+                    )
+                }).inner;
+                match action {
+                    Some(ReaderAction::Image(image)) => {
                         self.preview_image = Some(image);
                         self.preview_zoom = None;
                     }
-                });
+                    Some(ReaderAction::Project(jump)) => self.open_project(ctx, jump),
+                    None => {}
+                }
             });
-        if self.show_settings {
-            self.image_settings(ctx);
-        }
-        if self.show_resources {
-            self.resource_window(ctx);
-        }
-        if self.show_skills {
-            self.skills_window(ctx);
-        }
-        self.image_preview(ctx);
+        self.dialogs(ctx);
     }
 
     fn clear_color(&self, _: &egui::Visuals) -> [f32; 4] {
@@ -3487,6 +4088,9 @@ fn main() -> eframe::Result<()> {
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
+    // Always open the conversation browser; transfer is an explicit destination.
+    prefs.workspace = migration_view::Workspace::Library;
+    prefs.timeline_view = false;
     if prefs.font_size < 12.0 {
         prefs.font_size = 15.0;
     }
@@ -3506,6 +4110,17 @@ fn main() -> eframe::Result<()> {
     if args.iter().any(|a| a == "--timeline") {
         prefs.projects_view = true;
         prefs.timeline_view = true;
+    }
+    if args.iter().any(|a| {
+        matches!(
+            a.as_str(),
+            "--projects" | "--timeline" | "--select" | "--resources" | "--preview-image"
+        )
+    }) {
+        prefs.workspace = migration_view::Workspace::Library;
+    }
+    if args.iter().any(|a| a == "--migration") {
+        prefs.workspace = migration_view::Workspace::Transfer;
     }
     let root = args
         .windows(2)
@@ -3595,6 +4210,17 @@ fn main() -> eframe::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn backup_progress_keeps_status_separate_from_final_results() {
+        assert_eq!(backup_progress(r#"{"progress":true,"tool":"codex","phase":"scan","completed_sources":1,"total_sources":6}"#).unwrap(), "2/6 · Codex · 正在检查会话变化");
+        assert_eq!(
+            backup_progress("codex: exported 25 changed sessions").unwrap(),
+            "Codex · 已更新 25 段会话"
+        );
+        assert!(backup_progress(r#"{"imported_local":true,"changed_sessions":4}"#).is_none());
+        assert!(backup_progress("ordinary output is not a progress update").is_none());
+    }
+
     #[test]
     fn skill_package_indexes_are_not_conversation_branches() {
         let root = std::env::temp_dir().join(format!("vault-skill-index-{}", std::process::id()));
@@ -3743,7 +4369,7 @@ mod tests {
                 },
                 |ctx| {
                     egui::CentralPanel::default().show(ctx, |ui| {
-                        if let Some(image) =
+                        if let Some(ReaderAction::Image(image)) =
                             show_message_cards(ui, &mut cards, &mut cache, 320, None, &mut None)
                         {
                             clicked = Some(image.uri);
@@ -3930,8 +4556,8 @@ mod tests {
     #[test]
     fn every_archive_source_has_a_readable_label() {
         assert_eq!(tool_name("codex"), "Codex");
-        assert_eq!(tool_name("claude"), "Claude");
-        assert_eq!(tool_name("claude-desktop"), "Claude Desktop");
+        assert_eq!(tool_name("claude"), "Claude Code");
+        assert_eq!(tool_name("claude-desktop"), "Claude App");
         assert_eq!(tool_name("chatgpt"), "ChatGPT");
         assert_eq!(tool_name("openclaw"), "OpenClaw");
         assert_eq!(tool_name("workbuddy"), "WorkBuddy");

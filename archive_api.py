@@ -98,13 +98,23 @@ def _row(branch, sid, value, tool=''):
         raise ValueError('Invalid conversation archived flag')
     if not isinstance(value.get('assets', []), list):
         raise ValueError('Invalid conversation image list')
+    relations = value.get('session_relations', [])
+    if not isinstance(relations, list) or len(relations) > 2:
+        raise ValueError('Invalid session relationships')
+    for relation in relations:
+        if (not isinstance(relation, dict) or relation.get('kind') not in ('subagent', 'fork')
+                or not isinstance(relation.get('parent_id'), str) or relation['parent_id'] == sid
+                or any(not isinstance(relation.get(key, ''), str) for key in ('agent_name', 'agent_type'))):
+            raise ValueError('Invalid session relationship')
+        component(relation['parent_id'])
     origin = value.get('origin_kind') or value.get('tool') or tool
     device = branch.removesuffix('-' + origin) if origin else branch
     return {'branch': branch, 'session_id': sid, 'title': value.get('title', sid),
             'tool': origin, 'project': value.get('project', ''), 'device': device,
             'updated_at': value.get('updated_at', ''), 'archived': value.get('archived'),
             'messages': value.get('messages', 0), 'images': len(value.get('assets', [])),
-            'attachments': value.get('attachments', 0), '_file': branch + '/' + relative}
+            'attachments': value.get('attachments', 0), 'session_relations': relations,
+            '_file': branch + '/' + relative}
 
 
 def _index(root, branch):

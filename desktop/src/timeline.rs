@@ -11,7 +11,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-const VERSION: u32 = 3;
+const VERSION: u32 = 4;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub(super) struct Node {
@@ -372,11 +372,55 @@ fn classify(text: &str, user: bool) -> Option<(&'static str, &str)> {
 }
 
 pub(super) fn extract(markdown: &str) -> Vec<Node> {
+    extract_with_roots(markdown, &[])
+}
+
+fn main_roots(session: &Session) -> Vec<String> {
+    if !super::claude_projects_view::is_main(session) {
+        return Vec::new();
+    }
+    session
+        .meta
+        .claude_project
+        .as_ref()
+        .unwrap()
+        .messages
+        .iter()
+        .map(|m| {
+            if m.thread_root_id.is_empty() {
+                m.id.clone()
+            } else {
+                m.thread_root_id.clone()
+            }
+        })
+        .collect()
+}
+
+pub(super) fn extract_session(session: &Session) -> Vec<Node> {
+    let roots = main_roots(session);
+    if roots.is_empty() {
+        extract(&session.markdown)
+    } else {
+        extract_with_roots(&session.markdown, &roots)
+    }
+}
+
+fn extract_with_roots(markdown: &str, roots: &[String]) -> Vec<Node> {
     let mut nodes: Vec<Node> = Vec::new();
     let mut request = String::new();
     let mut result = None;
     let mut request_node: Option<usize> = None;
     for (message_index, card) in message_cards(body(markdown)).into_iter().enumerate() {
+        if message_index > 0
+            && !roots.is_empty()
+            && roots.get(message_index) != roots.get(message_index - 1)
+        {
+            if let Some(node) = result.take() {
+                nodes.push(node);
+            }
+            request.clear();
+            request_node = None;
+        }
         if card.context.is_some() || !matches!(card.role, "用户" | "助手") {
             continue;
         }
@@ -521,6 +565,7 @@ fn refresh_at(
             &session.markdown,
             &session.meta.started_at,
             &session.meta.updated_at,
+            main_roots(session),
         ));
         let entry = match old.sessions.remove(&key) {
             Some(entry) if entry.fingerprint == fingerprint => {
@@ -532,7 +577,7 @@ fn refresh_at(
                 changed = true;
                 CachedSession {
                     fingerprint,
-                    nodes: extract(&session.markdown),
+                    nodes: extract_session(session),
                 }
             }
         };

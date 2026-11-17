@@ -39,7 +39,8 @@ class McpTest(unittest.TestCase):
         environment.start()
         self.addCleanup(environment.stop)
         for name in ('vault_mcp.py', 'archive_api.py', 'vault.py', 'resources.py', 'skills_backup.py',
-                     'claude_desktop.py', 'claude_cache.py', 'claude_projects.py'):
+                     'claude_desktop.py', 'claude_cache.py', 'claude_projects.py', 'claude_project_names.py',
+                     'archive_storage.py', 'session_relations.py', 'archive_transfer.py'):
             shutil.copy2(Path(mcp.__file__).parent / name, self.code / name)
         self.script = self.code / 'vault_mcp.py'
         self.branch = 'test-machine-codex'

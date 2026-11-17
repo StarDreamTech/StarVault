@@ -75,6 +75,80 @@ class ClaudeProjectsTest(unittest.TestCase):
                 (path.read_bytes(), path.stat().st_mtime_ns)
                 for path in self.dest.parent.rglob('*') if path.is_file()}
 
+    def test_saved_project_and_thread_names_upgrade_without_changing_identity(self):
+        self.responses[self.home] = [response(self.home, event(message(in_timeline=True, has_thread=True)))]
+        self.export()
+        original_ids = set(self.sessions())
+        labels = {(CHANNEL, ''): {'title': '项目昵称', 'sequence': 100, 'source': 'session-navigation'},
+                  (CHANNEL, ROOT): {'title': '讨论串正式标题', 'sequence': 100, 'source': 'session-navigation'}}
+        with patch('claude_project_names.labels', return_value=labels):
+            self.export()
+        self.assertEqual(set(self.sessions()), original_ids)
+        for row in self.sessions().values():
+            self.assertEqual(row['project'], '项目昵称')
+            self.assertEqual(row['title'], '主对话' if row['claude_project']['view'] == 'main' else '讨论串正式标题')
+        original = self.files()
+        self.responses[self.home] = []
+        self.assertEqual(self.export()['changed_sessions'], 0)
+        self.assertEqual(self.files(), original)
+        stale = {(CHANNEL, ''): dict(labels[(CHANNEL, '')], title='过期昵称', sequence=10)}
+        with patch('claude_project_names.labels', return_value=stale):
+            self.assertEqual(self.export()['changed_sessions'], 0)
+        newer = {(CHANNEL, ''): dict(labels[(CHANNEL, '')], title='修改后的昵称', sequence=200)}
+        with patch('claude_project_names.labels', return_value=newer):
+            self.assertEqual(self.export()['changed_sessions'], len(original_ids))
+            self.assertEqual(self.export()['changed_sessions'], 0)
+        self.assertTrue(all(row['project'] == '修改后的昵称' for row in self.sessions().values()))
+
+    def test_text_cleanup_preserves_projects_across_cache_eviction_and_new_replies(self):
+        import archive_storage
+        self.responses[self.home] = [response(self.home, event(message(in_timeline=True, has_thread=True)))]
+        self.export()
+        ids = set(self.sessions())
+        archive_storage.cleanup_text(self.dest.parent, plan=False)
+        self.assertFalse(list((self.dest.parent / 'records').glob('*/*/source.jsonl')))
+        self.assertTrue(list((self.dest.parent / 'records').glob('*/*/project-state.jsonl')))
+        self.responses[self.home] = []
+        self.assertEqual(self.export()['changed_sessions'], 0)
+        self.responses[self.home] = [response(self.home, event(message(ANSWER, 'A new answer', role='assistant', seq='2')), mtime=200)]
+        self.export()
+        self.assertEqual(set(self.sessions()), ids)
+        thread = next(row for row in self.sessions().values() if row['claude_project']['view'] == 'thread')
+        self.assertIn('Fixture question', self.markdown(thread))
+        self.assertIn('A new answer', self.markdown(thread))
+        self.assertEqual(self.export()['changed_sessions'], 0)
+        self.assertFalse(list((self.dest.parent / 'records').glob('*/*/source.jsonl')))
+        archive_storage.save_preferences(self.dest.parent, ['claude-desktop'], False)
+        self.export()
+        self.assertEqual(self.export()['changed_sessions'], 0)
+        thread = next(row for row in self.sessions().values() if row['claude_project']['view'] == 'thread')
+        self.assertIn('A new answer', self.markdown(thread))
+
+    def test_thread_starting_title_is_preserved_but_saved_navigation_name_wins(self):
+        def starting(title, at):
+            return event({'thread_root_id': ROOT, 'title': title, 'at': at}, 'thread_starting')
+
+        self.responses[self.home] = [response(self.home, event(message()) + starting('初始讨论标题', 100))]
+        self.export()
+        row, = self.sessions().values()
+        self.assertEqual(row['title'], '初始讨论标题')
+        self.assertTrue(row['project'].startswith('未命名项目 · '))
+        # A newer file containing an older event must not roll back the title.
+        self.responses[self.home] = [response(self.home, starting('旧启动标题', 90), mtime=200)]
+        self.assertEqual(self.export()['changed_sessions'], 0)
+        # No title from a response with a corrupt completed message may be saved.
+        self.responses[self.home] = [response(self.home, starting('损坏响应标题', 300) + event({'id': ROOT}))]
+        self.assertEqual(self.export()['changed_sessions'], 0)
+        self.responses[self.home] = [response(self.home, starting('新启动标题', 400))]
+        labels = {(CHANNEL, ROOT): {'title': '导航中重命名的讨论', 'sequence': 1, 'source': 'session-navigation'}}
+        with patch('claude_project_names.labels', return_value=labels):
+            self.assertEqual(self.export()['changed_sessions'], 1)
+        row, = self.sessions().values()
+        self.assertEqual(row['title'], '导航中重命名的讨论')
+        self.assertEqual(self.export()['changed_sessions'], 0)
+        self.responses[self.home] = []
+        self.assertEqual(self.export()['changed_sessions'], 0)
+
     def test_overlap_deduplicates_and_repeat_does_not_rewrite(self):
         question = message(attachments=[{'file_id': 'file-fixture', 'filename': 'chart.png',
                                          'mime_type': 'image/png', 'size_bytes': 128}])
@@ -227,6 +301,100 @@ class ClaudeProjectsTest(unittest.TestCase):
         self.assertEqual(row['messages'], 2)
         self.assertIn('Fixture helper answer', self.markdown(row))
 
+    def test_channel_main_preserves_order_links_and_discussion_identity(self):
+        other_root = 'cmsg_' + '3' * 46
+        main = message(in_timeline=True, reply_count='1', thread_status='working')
+        reply = message(ANSWER, 'Discussion answer only', 'assistant', '3', in_timeline=False)
+        next_main = message(other_root, 'Main agent opens another discussion', 'assistant', '4',
+                            thread_root_id=other_root, in_timeline=True, reply_count='0',
+                            links=[{'kind': 'thread', 'thread_id': ROOT, 'href': '/untrusted-link'}])
+        self.responses[self.home] = [response(self.home, event(next_main) + event(reply) + event(main))]
+        self.assertEqual(self.export()['changed_sessions'], 3)
+        sessions = list(self.sessions().values())
+        channel, = [row for row in sessions if row['claude_project']['view'] == 'main']
+        thread, = [row for row in sessions if row['claude_project']['thread_root_id'] == ROOT]
+        self.assertEqual(channel['title'], '主对话')
+        self.assertEqual(channel['messages'], 2)
+        self.assertNotIn('Discussion answer only', self.markdown(channel))
+        self.assertIn('Discussion answer only', self.markdown(thread))
+        self.assertEqual(thread['claude_project']['reply_count'], 1)
+        self.assertEqual([row['id'] for row in channel['claude_project']['messages']], [ROOT, other_root])
+        self.assertEqual(channel['claude_project']['messages'][1]['linked_thread_ids'], [ROOT])
+        self.assertNotIn('href', json.dumps(channel['claude_project']))
+        standalone, = [row for row in sessions if row['claude_project']['view'] == 'timeline_item']
+        self.assertEqual(standalone['claude_project']['thread_root_id'], other_root)
+        before = self.files()
+        self.responses[self.home] = []
+        self.assertEqual(self.export()['changed_sessions'], 0)
+        self.assertEqual(self.files(), before)
+
+        moved = dict(main, in_timeline=False)
+        self.responses[self.home] = [response(self.home, event(moved, 'channel_message_updated'), response_time=400)]
+        self.export()
+        sessions = self.sessions()
+        self.assertNotIn('Fixture question', self.markdown(sessions[channel['id']]))
+        self.assertIn('Fixture question', self.markdown(sessions[thread['id']]))
+
+    def test_null_body_updates_keep_text_and_partial_replies_do_not_become_content(self):
+        original = message(body='Question\u2028with a Unicode separator', in_timeline=True,
+                           thread_status='working')
+        updated = message(body=None, in_timeline=True, reply_count='2', thread_status='needs_input')
+        answer = message(ANSWER, 'Complete discussion reply', 'assistant', '2', in_timeline=False)
+        self.responses[self.home] = [response(self.home, event(original), response_time=100)]
+        self.export()
+        original_thread = next(row['id'] for row in self.sessions().values()
+                               if row['claude_project']['view'] == 'thread')
+        self.responses[self.home] = [response(self.home, event(updated, 'channel_message_updated') +
+                                              event(answer), response_time=200)]
+        self.assertEqual(self.export()['changed_sessions'], 2)
+        sessions = self.sessions()
+        thread = sessions[original_thread]
+        self.assertEqual(thread['claude_project']['status'], 'needs_input')
+        self.assertEqual(thread['messages'], 2)
+        self.assertIn(original['body'], self.markdown(thread))
+        self.assertIn('Complete discussion reply', self.markdown(thread))
+        channel = next(row for row in sessions.values() if row['claude_project']['view'] == 'main')
+        self.assertEqual(channel['messages'], 1)
+        self.assertIn(original['body'], self.markdown(channel))
+        before = self.files()
+        self.assertEqual(self.export()['changed_sessions'], 0)
+        self.assertEqual(self.files(), before)
+
+    def test_main_sequence_is_thread_local_and_timestamps_order_across_timezones(self):
+        early_id = 'cmsg_' + '9' * 46
+        late_id = 'cmsg_' + '1' * 46
+        early = message(early_id, 'First main question', seq='0', thread_root_id=early_id,
+                        in_timeline=True, reply_count='0', created_at='2026-11-12T10:00:00+08:00')
+        late = message(late_id, 'Later main answer', 'assistant', '0', thread_root_id=late_id,
+                       in_timeline=True, reply_count='0', created_at='2026-11-12T03:00:00Z')
+        self.responses[self.home] = [response(self.home, event(late) + event(early))]
+        self.export()
+        main = next(row for row in self.sessions().values() if row['claude_project']['view'] == 'main')
+        self.assertEqual([m['id'] for m in main['claude_project']['messages']], [early_id, late_id])
+        self.assertLess(self.markdown(main).index('First main question'), self.markdown(main).index('Later main answer'))
+
+    def test_old_thread_snapshot_upgrades_without_live_cache(self):
+        self.responses[self.home] = [response(self.home, event(message(in_timeline=True)))]
+        self.export()
+        sessions = self.sessions()
+        thread = next(row for row in sessions.values() if row['claude_project']['view'] == 'thread')
+        channel = next(row for row in sessions.values() if row['claude_project']['view'] == 'main')
+        # Simulate a v1 thread archive: no channel projection or index relations.
+        self.snapshot(channel).unlink()
+        sessions.pop(channel['id'])
+        thread.pop('claude_project')
+        (self.dest / 'index.json').write_text(json.dumps({'sessions': sessions}), encoding='utf-8')
+        (self.dest / '.export-cache.json').write_text('{}', encoding='utf-8')
+        rows = [json.loads(line) for line in self.snapshot(thread).read_text(encoding='utf-8').split('\n') if line]
+        for row in rows:
+            row.pop('cache_projection')
+            row.pop('project_message')
+        self.snapshot(thread).write_text(''.join(json.dumps(row) + '\n' for row in rows), encoding='utf-8')
+        self.responses[self.home] = []
+        self.assertEqual(self.export()['changed_sessions'], 2)
+        self.assertIn(thread['id'], self.sessions())
+        self.assertEqual(len(self.sessions()), 2)
+
     def test_product_channel_and_thread_identity_do_not_collide(self):
         sibling = self.home.with_name('Claude-3p')
         sibling.mkdir()
@@ -239,9 +407,17 @@ class ClaudeProjectsTest(unittest.TestCase):
                      name='thread_0'),
         ]
         self.responses[sibling] = [response(sibling, event(message()))]
-        self.assertEqual(self.export()['changed_sessions'], 4)
+        def labels(home, warnings):
+            return {(CHANNEL, ''): {'title': Path(home).name + ' 项目',
+                    'source': 'session-navigation', 'sequence': 10}}
+        with patch('claude_project_names.labels', side_effect=labels):
+            self.assertEqual(self.export()['changed_sessions'], 4)
         self.assertEqual(len(self.sessions()), 4)
         self.assertTrue(all(row['messages'] == 1 for row in self.sessions().values()))
+        for row in self.sessions().values():
+            relation = row['claude_project']
+            expected = relation['product'] + ' 项目' if relation['channel_id'] == CHANNEL else '未命名项目 · ' + OTHER_CHANNEL[-8:]
+            self.assertEqual(row['project'], expected)
 
     def test_snapshot_symlink_is_rejected_without_touching_external_data(self):
         self.responses[self.home] = [response(self.home, event(message()))]

@@ -22,10 +22,12 @@ import urllib.parse
 import urllib.request
 import urllib.error
 import resources
+import archive_storage
 import skills_backup
 import archive_api
 import claude_desktop
 import claude_projects
+import session_relations
 
 ROOT = Path(__file__).resolve().parent
 
@@ -44,7 +46,7 @@ def config_directory():
 
 
 LOCAL = config_directory()
-VERSION = 5
+VERSION = 6
 TOOLS = ('codex', 'claude', 'claude-desktop', 'workbuddy', 'openclaw', 'dsh', 'chatgpt')
 # Repository branches stay "<device>-<tool>"; these are the local homes each tool owns.
 HOME_DIRS = {'codex': '.codex', 'claude': '.claude', 'workbuddy': '.workbuddy-ai',
@@ -52,7 +54,8 @@ HOME_DIRS = {'codex': '.codex', 'claude': '.claude', 'workbuddy': '.workbuddy-ai
 ORIGINATORS = {'claude': 'Claude Code CLI', 'workbuddy': 'WorkBuddy',
                'openclaw': 'OpenClaw', 'dsh': 'DeepSeek Harness'}
 # Recognize binary signatures, including images inside JSON-encoded tool results.
-MEDIA = re.compile(rb'(?:data:[a-zA-Z0-9.+/-]+;base64,)?(?<![A-Za-z0-9+/])(?:iVBORw0KGgo|/9j/|R0lGOD|UklGR)[A-Za-z0-9+/]{40,}={0,2}')
+MEDIA = re.compile(rb'(?:iVBORw0KGgo|/9j/|R0lGOD|UklGR)[A-Za-z0-9+/]{40,}={0,2}')
+MEDIA_PREFIX = re.compile(rb'data:[a-zA-Z0-9.+/-]+;base64,')
 IMAGE_REF = re.compile(r'vault-image:([0-9a-f]{64}\.(?:png|jpg|gif|webp))')
 DATA_URI = re.compile(r'data:[^\s,;]+;base64,[A-Za-z0-9+/=\s]+')
 MARKDOWN_IMAGE = re.compile(r'!\[([^\]]*)\]\(([^)\n]+)\)')
@@ -662,6 +665,11 @@ def session_id(path, tool):
     return path.stem
 
 
+def file_stamp(path):
+    stat = path.stat()
+    return [stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns, stat.st_dev, stat.st_ino]
+
+
 def prepare_jsonl(path, directory):
     """Prepare a stable snapshot; it is published only after transcript validation."""
     before = path.stat()
@@ -717,9 +725,9 @@ def session_items(tool, home, previous_root=None, warnings=None):
     if tool == 'claude-desktop':
         for item in claude_desktop.session_items(home):
             path = item['path']
-            stat = path.stat()
             yield {'id': item['id'], 'meta': item['meta'], 'origin': str(path),
-                   'signature': [VERSION, str(path), stat.st_size, stat.st_mtime_ns, item['meta']],
+                   'signature': [VERSION, str(path), *file_stamp(path), item['meta']],
+                   'direct_text': path.suffix == '.jsonl',
                    'prepare': lambda directory, path=path: prepare_jsonl(path, directory)}
         for item in claude_projects.session_items(home, previous_root=previous_root, warnings=warnings):
             item['signature'] = [VERSION, *item['signature']]
@@ -754,11 +762,13 @@ def session_items(tool, home, previous_root=None, warnings=None):
         if sid not in paths or path.stat().st_mtime_ns > paths[sid].stat().st_mtime_ns:
             paths[sid] = path
     for sid, path in paths.items():
-        meta = metas.get(sid) or metas.get('session-' + sid) or {}
-        stat = path.stat()
+        meta = dict(metas.get(sid) or metas.get('session-' + sid) or {})
+        if tool == 'claude':
+            meta.update(session_relations.claude(path, sid))
         item = {'id': sid, 'meta': meta, 'origin': str(path),
-                'signature': [VERSION, str(path), stat.st_size, stat.st_mtime_ns, meta]}
+                'signature': [VERSION, str(path), *file_stamp(path), meta]}
         if tool == 'dsh' or path.suffix in ('.zst', '.zstd'):
+            item['direct_text'] = path.suffix == '.jsonl'
             item['prepare'] = lambda directory, path=path: prepare_jsonl(path, directory)
             if tool == 'codex':
                 item['snapshot_name'] = 'source.jsonl.zst'
@@ -788,22 +798,32 @@ def save_image(data, dest, copy=True):
 
 def extract_images(raw, dest, found, copy=None):
     if copy is None: copy = 'images' in resources.policy(dest.parent)
-    def replace(match):
-        encoded = match.group().split(b';base64,')[-1]
+    chunks = []; cursor = 0
+    # Start with literal image signatures so large text records can be skipped quickly.
+    for match in MEDIA.finditer(raw):
+        start = match.start()
+        if start and raw[start - 1] in b'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/':
+            continue
         try:
-            data = base64.b64decode(encoded, validate=True)
+            data = base64.b64decode(match.group(), validate=True)
         except ValueError:
-            return match.group()
+            continue
         name = save_image(data, dest, copy=copy)
         if not name:
-            return match.group()
+            continue
+        prefix = raw.rfind(b'data:', cursor, start)
+        if prefix >= cursor and MEDIA_PREFIX.fullmatch(raw, prefix, start): start = prefix
+        chunks.extend((raw[cursor:start], ('vault-image:' + name).encode('ascii')))
+        cursor = match.end()
         found.add(name)
-        return ('vault-image:' + name).encode('ascii')
-    return MEDIA.sub(replace, raw)
+    if not chunks: return raw
+    chunks.append(raw[cursor:])
+    return b''.join(chunks)
 
 
-def copy_local_images(row, cwd, dest, found, missing, refs=None):
+def copy_local_images(row, cwd, dest, found, missing, refs=None, copy=None):
     """Copy explicit local image links; never download remote URLs or follow model files."""
+    if copy is None: copy = 'images' in resources.policy(dest.parent)
     def local(ref):
         ref = ref.strip('<>')
         if ref.startswith(('http:', 'https:', 'data:', 'vault-image:')):
@@ -816,7 +836,7 @@ def copy_local_images(row, cwd, dest, found, missing, refs=None):
         try:
             if not path.is_file():
                 missing.add(str(path)); return None
-            name = save_image(path.read_bytes(), dest, copy='images' in resources.policy(dest.parent))
+            name = save_image(path.read_bytes(), dest, copy=copy)
         except PermissionError:
             missing.add(str(path)); return None
         if name:
@@ -896,7 +916,7 @@ def row_time(tool, row):
     return iso_time(value)
 
 
-def export_session(path, tool, dest, meta, sid=None, origin=None, source_copy=None):
+def export_session(path, tool, dest, meta, sid=None, origin=None, source_copy=None, expected_stamp=None):
     sid = sid or session_id(path, tool)
     archive_api.component(sid)
     archive_api.component(dest.name)
@@ -906,6 +926,11 @@ def export_session(path, tool, dest, meta, sid=None, origin=None, source_copy=No
     info.update({'id': sid, 'tool': tool, 'source_file': str(source)})
     if source_copy:
         info['source_copy'] = source.relative_to(dest.parent).as_posix()
+    only_text = archive_storage.text_only(dest.parent)
+    snapshots = archive_storage.source_snapshots(dest.parent)
+    copy_images = 'images' in resources.policy(dest.parent)
+    info.update(text_only=only_text, source_snapshots=snapshots,
+                source_retained=bool(source_copy) and snapshots)
     declared_title = info.get('title', '')
     if origin:
         info['source_origin'] = str(origin)
@@ -923,7 +948,7 @@ def export_session(path, tool, dest, meta, sid=None, origin=None, source_copy=No
                 partial = True; break
             line_images = set()
             original_size = len(raw); original_digest = hashlib.sha256(raw).hexdigest()
-            raw = extract_images(raw, dest, line_images)
+            raw = extract_images(raw, dest, line_images, copy=copy_images)
             try:
                 row = json.loads(raw)
             except ValueError as error:
@@ -936,6 +961,10 @@ def export_session(path, tool, dest, meta, sid=None, origin=None, source_copy=No
             if row.get('type') == 'session_meta':
                 origin_records.append(row)
                 if not info.get('cwd'): info['cwd'] = payload.get('cwd', '')
+                if tool == 'codex' and payload.get('id', sid) == sid:
+                    info.setdefault('session_relations', session_relations.codex(payload, sid))
+                    if any(r['kind'] == 'subagent' for r in info['session_relations']):
+                        info['source'] = 'subagent'
             elif row.get('type') == 'turn_context':
                 if payload.get('model'): models.add(payload['model'])
             if tool in ('claude', 'claude-desktop') and row.get('cwd') and not info.get('cwd'): info['cwd'] = row['cwd']
@@ -945,7 +974,7 @@ def export_session(path, tool, dest, meta, sid=None, origin=None, source_copy=No
                 resources.collect(row, info.get('cwd', ''), ordinal, refs)
             if tool == 'workbuddy':
                 row = workbuddy_images(row)
-            row = copy_local_images(row, info.get('cwd', ''), dest, line_images, missing, refs)
+            row = copy_local_images(row, info.get('cwd', ''), dest, line_images, missing, refs, copy=copy_images)
             assets.update(line_images)
             timestamp = row_time(tool, row)
             if timestamp:
@@ -1094,9 +1123,14 @@ def export_session(path, tool, dest, meta, sid=None, origin=None, source_copy=No
     pending = {}
     for name in ('manifest.json', 'dialogue.jsonl'):
         archive_api.safe_path(dest.parent, f'records/{dest.name}/{sid}/{name}')
+    if source_copy and not snapshots and info.get('source') == 'code-projects-cache':
+        state = source.with_name('project-state.jsonl')
+        info['project_state'] = state.relative_to(dest.parent).as_posix()
+        local_meta['project_state'] = info['project_state']
+        pending[state] = archive_storage.project_state(path, sid)
     resources.finish(dest.parent, dest.name, sid, source, refs, operations, local_meta, originals,
                      lambda target, data: pending.__setitem__(target, data))
-    if source_copy:
+    if source_copy and snapshots:
         pending[source] = source_copy[0].read_bytes()
     # Full original metadata and commands stay local. Git gets classification fields only.
     info.pop('origin_metadata', None)
@@ -1112,6 +1146,8 @@ def export_session(path, tool, dest, meta, sid=None, origin=None, source_copy=No
         pending[target] = data.encode('utf-8') if isinstance(data, str) else data
     if shutil.disk_usage(dest.parent).free < sum(map(len, pending.values())) + 256 * 1024**2:
         raise RuntimeError('磁盘空间不足，保留已有会话备份')
+    if expected_stamp is not None and file_stamp(path) != expected_stamp:
+        raise RuntimeError('会话正在变化，下次重试：' + path.name)
     for target, data in pending.items():
         write(target, data)
     return info
@@ -1126,6 +1162,9 @@ def export(tool, home, dest, force=False):
     cache_path = dest / '.export-cache.json'
     cache = read_json(cache_path, {})
     count = 0; errors = []; warnings = []
+    only_text = archive_storage.text_only(dest.parent)
+    snapshots = archive_storage.source_snapshots(dest.parent)
+    copy_images = 'images' in resources.policy(dest.parent)
     for item in session_items(tool, home, previous_root=dest, warnings=warnings):
         sid = item['id']
         try:
@@ -1139,15 +1178,26 @@ def export(tool, home, dest, force=False):
             if previous:
                 archive_api._row(dest.name, sid, previous, tool)
                 previous_file = archive_api.safe_path(dest.parent, dest.name + '/' + previous['file'])
+            manifest = archive_api.safe_path(dest.parent, record + 'manifest.json')
+            previous_meta = resources.read(manifest, {}).get('metadata', {})
             if (not force and cache.get(sid) == signature and previous
                     and previous_file.is_file()
-                    and archive_api.safe_path(dest.parent, record + 'manifest.json').is_file()
+                    and manifest.is_file()
                     and archive_api.safe_path(dest.parent, record + 'dialogue.jsonl').is_file()
-                    and ('prepare' not in item or staged.is_file())
-                    and ('images' not in resources.policy(dest.parent) or
+                    and (only_text or (previous_meta.get('text_only', False) == only_text
+                         and previous_meta.get('source_snapshots', not previous_meta.get('text_only', False)) == snapshots))
+                    and (('prepare' not in item or staged.is_file()) if snapshots else
+                         (item['meta'].get('source') != 'code-projects-cache' or
+                          archive_api.safe_path(dest.parent, record + 'project-state.jsonl').is_file() or staged.is_file()))
+                    and (not copy_images or
                          all((dest.parent / 'images' / name).is_file() for name in previous['assets']))):
                 continue
-            if 'prepare' in item:
+            if not snapshots and item.get('direct_text'):
+                path = Path(item['origin'])
+                stamp = file_stamp(path)
+                info = export_session(path, tool, dest, item['meta'], sid=sid, origin=str(path),
+                                      expected_stamp=stamp)
+            elif 'prepare' in item:
                 with tempfile.TemporaryDirectory(prefix='.session-', dir=dest.parent) as temporary:
                     path = item['prepare'](Path(temporary))
                     info = export_session(path, tool, dest, item['meta'], sid=sid, origin=item.get('origin'),
@@ -1220,12 +1270,14 @@ def enabled_tools(cfg):
     tools.extend(tool for tool in ('openclaw', 'workbuddy', 'dsh') if home_for(tool, cfg).is_dir())
     if (LOCAL / 'imports/chatgpt/metadata.json').exists():
         tools.append('chatgpt')
-    return tools
+    selected = archive_storage.preferences(Path(cfg['archive'])).get('tools')
+    return [tool for tool in tools if selected is None or tool in selected]
 
 
 def sync(cfg, tools, upload):
     summaries = []
-    settings = skill_policy(Path(cfg['archive']))
+    manual_only = archive_storage.preferences(Path(cfg['archive'])).get('manual_only', False)
+    settings = None if manual_only else skill_policy(Path(cfg['archive']))
     if settings is not None:
         try:
             result = collect_skills(Path(cfg['archive']), cfg, settings)
@@ -1253,9 +1305,10 @@ def sync(cfg, tools, upload):
             except (RuntimeError, OSError, subprocess.TimeoutExpired) as error:
                 network_error = error
         source_home = home_for(tool, cfg)
-        summary = export(tool, source_home, dest)
+        summary = ({'tool': tool, 'import_skipped': 'manual_only'} if upload and manual_only
+                   else export(tool, source_home, dest))
         try:
-            if (Path(cfg['archive']) / '.migration.json').exists():
+            if not (upload and manual_only) and (Path(cfg['archive']) / '.migration.json').exists():
                 summary['local_migration'] = resources.migrate(Path(cfg['archive']), resources.policy(Path(cfg['archive'])), branch=branch)
         except (OSError, RuntimeError, ValueError) as error:
             summary['migration_error'] = str(error)
@@ -1324,6 +1377,19 @@ def main(argv=None, prog=None):
     for name in ['export', 'sync']:
         command = sub.add_parser(name, help='Export locally' if name == 'export' else 'Export, commit and push both branches')
         command.add_argument('--tool', choices=[*TOOLS, 'all'], default='all')
+    local_import = sub.add_parser('import-local', help='Manually import selected local sources, without Git or upload')
+    local_import.add_argument('--archive')
+    local_import.add_argument('--tools', required=True, help='Comma-separated sources')
+    local_import.add_argument('--with-resources', action='store_true', help='Retain source snapshots and copy images; default is text only')
+    local_import.add_argument('--resource-kinds', help='Copy only these attachment kinds: images,models,documents,code,logs,other; none disables attachments')
+    local_import.add_argument('--source-snapshots', action='store_true', help='Also retain full event snapshots (uses more space)')
+    cleanup = sub.add_parser('cleanup-text', help='Remove archive resource copies, preserving conversation text and Projects state')
+    cleanup.add_argument('--archive')
+    cleanup.add_argument('--plan', action='store_true')
+    transfer = sub.add_parser('transfer-archive', help='Check or copy the existing archive into a new portable folder')
+    transfer.add_argument('--archive')
+    transfer.add_argument('--destination', type=Path, help='Existing parent folder; a new StarVault folder is created inside')
+    transfer.add_argument('--plan', action='store_true')
     migration = sub.add_parser('migrate', help='Plan/copy associated attachments locally; never upload')
     migration.add_argument('--archive')
     migration.add_argument('--kinds', default='images')
@@ -1385,6 +1451,50 @@ def main(argv=None, prog=None):
         with lock():
             cfg = config(); selected = enabled_tools(cfg)
             sync(cfg, selected if args.tool == 'all' else [args.tool], args.command == 'sync')
+    elif args.command == 'import-local':
+        with lock():
+            cfg = read_json(LOCAL / 'config.json', {})
+            if not (args.archive or cfg.get('archive')):
+                parser.error('Specify --archive or run init first')
+            root = Path(args.archive or cfg.get('archive', '')).expanduser().resolve()
+            selected = list(filter(None, args.tools.split(',')))
+            root.mkdir(parents=True, exist_ok=True)
+            kinds = (set(filter(None, args.resource_kinds.split(','))) - {'none'}
+                     if args.resource_kinds is not None else
+                     (resources.policy(root) or {'images'}) if args.with_resources else set())
+            if kinds - set(resources.KINDS):
+                parser.error('Unknown attachment kinds: ' + ','.join(sorted(kinds - set(resources.KINDS))))
+            snapshots = args.source_snapshots or args.with_resources or 'logs' in kinds
+            only_text = not (kinds or snapshots)
+            archive_storage.save_preferences(root, selected, only_text, snapshots=snapshots)
+            resources.save_policy(root, kinds)
+            device = archive_api.component(cfg.get('device') or default_device())
+            results = []
+            for tool in selected:
+                print(json.dumps({'progress': True, 'tool': tool, 'phase': 'scan',
+                                  'completed_sources': len(results), 'total_sources': len(selected)}), flush=True)
+                branch = archive_api.component(device + '-' + tool)
+                from vault_mcp import check_write_tree
+                for folder in (branch, 'records/' + branch, 'images', 'attachments'):
+                    check_write_tree(root, folder)
+                summary = export(tool, home_for(tool, cfg), root / branch)
+                if kinds:
+                    print(json.dumps({'progress': True, 'tool': tool, 'phase': 'attachments',
+                                      'completed_sources': len(results), 'total_sources': len(selected)}), flush=True)
+                    summary['local_migration'] = resources.migrate(root, kinds, branch=branch)
+                results.append(summary)
+            print(json.dumps({'imported_local': True, 'text_only': only_text, 'kinds': sorted(kinds),
+                              'source_snapshots': snapshots,
+                              'changed_sessions': sum(r['changed_sessions'] for r in results), 'results': results}, ensure_ascii=False))
+    elif args.command == 'transfer-archive':
+        import archive_transfer
+        with lock():
+            root = Path(args.archive or config()['archive']).expanduser().resolve()
+            print(json.dumps(archive_transfer.transfer(root, args.destination, args.plan), ensure_ascii=False))
+    elif args.command == 'cleanup-text':
+        with lock():
+            root = Path(args.archive or config()['archive']).expanduser().resolve()
+            print(json.dumps(archive_storage.cleanup_text(root, args.plan), ensure_ascii=False))
     elif args.command == 'attachment-policy':
         with lock():
             root = Path(args.archive or config()['archive']).expanduser().resolve()

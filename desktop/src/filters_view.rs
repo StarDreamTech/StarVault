@@ -26,7 +26,7 @@ pub(super) fn show(ctx: &egui::Context, filters: &mut Filters, catalog: &Catalog
         )
         .show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.label(RichText::new("筛选").size(17.0).strong());
+                ui.label(RichText::new("客户端").size(17.0).strong());
                 if active > 0 {
                     ui.label(RichText::new(format!("{active} 项")).small().color(MUTED));
                 }
@@ -52,12 +52,23 @@ pub(super) fn show(ctx: &egui::Context, filters: &mut Filters, catalog: &Catalog
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     ui.spacing_mut().item_spacing.y = 6.0;
-                    ui.label(RichText::new("对话来源").small().color(MUTED));
+                    ui.label(RichText::new("AI 客户端").small().color(MUTED));
                     let tools: BTreeSet<_> = catalog
                         .sessions
                         .iter()
                         .map(|s| s.meta.tool.clone())
                         .filter(|tool| !tool.is_empty())
+                        .chain(
+                            [
+                                "codex",
+                                "claude",
+                                "claude-desktop",
+                                "workbuddy",
+                                "openclaw",
+                                "dsh",
+                            ]
+                            .map(String::from),
+                        )
                         .collect();
                     for tool in std::iter::once(String::new()).chain(tools) {
                         let name = if tool.is_empty() {
@@ -68,7 +79,10 @@ pub(super) fn show(ctx: &egui::Context, filters: &mut Filters, catalog: &Catalog
                         let count = catalog
                             .sessions
                             .iter()
-                            .filter(|s| tool.is_empty() || s.meta.tool == tool)
+                            .filter(|s| {
+                                !super::claude_projects_view::is_timeline_item(s)
+                                    && (tool.is_empty() || s.meta.tool == tool)
+                            })
                             .count();
                         let selected = filters.tool == tool;
                         let (rect, response) = ui.allocate_exact_size(
@@ -118,7 +132,11 @@ pub(super) fn show(ctx: &egui::Context, filters: &mut Filters, catalog: &Catalog
                             MUTED,
                         );
                         let response = response
-                            .on_hover_text(format!("{name} · {count} 个会话"))
+                            .on_hover_text(if count == 0 && !tool.is_empty() {
+                                format!("{name} · 尚无已备份会话")
+                            } else {
+                                format!("{name} · {count} 个会话")
+                            })
                             .on_hover_cursor(egui::CursorIcon::PointingHand);
                         if response.clicked() && !selected {
                             filters.tool = tool;
@@ -142,36 +160,6 @@ pub(super) fn show(ctx: &egui::Context, filters: &mut Filters, catalog: &Catalog
                             .map(|s| s.meta.project.clone())
                             .collect(),
                     );
-                    changed |= filter_combo(
-                        ui,
-                        "模型",
-                        &mut filters.model,
-                        catalog
-                            .sessions
-                            .iter()
-                            .flat_map(|s| s.meta.models.clone())
-                            .collect(),
-                    );
-                    changed |= filter_combo(
-                        ui,
-                        "会话类型",
-                        &mut filters.source,
-                        catalog
-                            .sessions
-                            .iter()
-                            .map(|s| s.meta.source.clone())
-                            .collect(),
-                    );
-                    changed |= filter_combo(
-                        ui,
-                        "原始标签",
-                        &mut filters.label,
-                        catalog
-                            .sessions
-                            .iter()
-                            .flat_map(|s| s.meta.labels.clone())
-                            .collect(),
-                    );
                     ui.add_space(6.0);
                     ui.label(RichText::new("更新时间").small().color(MUTED));
                     ui.horizontal_wrapped(|ui| {
@@ -183,12 +171,56 @@ pub(super) fn show(ctx: &egui::Context, filters: &mut Filters, catalog: &Catalog
                                 .changed();
                         }
                     });
+                    ui.add_space(8.0);
+                    let advanced_active = [&filters.model, &filters.source, &filters.label]
+                        .iter()
+                        .filter(|v| !v.is_empty())
+                        .count();
+                    egui::CollapsingHeader::new(if advanced_active > 0 {
+                        format!("更多筛选 · {advanced_active}")
+                    } else {
+                        "更多筛选".into()
+                    })
+                    .id_salt("advanced-archive-filters")
+                    .default_open(advanced_active > 0)
+                    .show(ui, |ui| {
+                        changed |= filter_combo(
+                            ui,
+                            "模型",
+                            &mut filters.model,
+                            catalog
+                                .sessions
+                                .iter()
+                                .flat_map(|s| s.meta.models.clone())
+                                .collect(),
+                        );
+                        changed |= filter_combo(
+                            ui,
+                            "会话类型",
+                            &mut filters.source,
+                            catalog
+                                .sessions
+                                .iter()
+                                .map(|s| s.meta.source.clone())
+                                .collect(),
+                        );
+                        changed |= filter_combo(
+                            ui,
+                            "原始标签",
+                            &mut filters.label,
+                            catalog
+                                .sessions
+                                .iter()
+                                .flat_map(|s| s.meta.labels.clone())
+                                .collect(),
+                        );
+                    });
                     let selected = [
                         ("tool", "来源", tool_name(&filters.tool)),
                         ("device", "电脑", filters.device.clone()),
                         ("project", "项目", filters.project.clone()),
                         ("model", "模型", filters.model.clone()),
-                        ("source", "类型", filters.source.clone()),
+                        ("source", "类型", super::source_name(&filters.source)),
                         ("label", "标签", filters.label.clone()),
                         (
                             "days",
@@ -274,7 +306,7 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_filters_are_visible_and_clickable_without_opening_a_menu() {
+    fn source_project_device_and_time_are_visible_and_clickable() {
         let catalog = Catalog {
             sessions: ["codex", "claude"]
                 .into_iter()
@@ -304,10 +336,13 @@ mod tests {
             };
             let mut source_position = egui::Pos2::ZERO;
             let mut clear_position = egui::Pos2::ZERO;
-            for frame in 0..8 {
+            let mut app_position = egui::Pos2::ZERO;
+            for frame in 0..11 {
                 let events = match frame {
-                    2 | 3 | 5 | 6 => {
-                        let pos = if frame <= 3 {
+                    2 | 3 | 5 | 6 | 8 | 9 => {
+                        let pos = if frame >= 8 {
+                            app_position
+                        } else if frame <= 3 {
                             source_position
                         } else {
                             clear_position
@@ -317,7 +352,7 @@ mod tests {
                             egui::Event::PointerButton {
                                 pos,
                                 button: egui::PointerButton::Primary,
-                                pressed: frame == 2 || frame == 5,
+                                pressed: frame == 2 || frame == 5 || frame == 8,
                                 modifiers: egui::Modifiers::NONE,
                             },
                         ]
@@ -356,15 +391,15 @@ mod tests {
                 let position =
                     |text: &str| labels.iter().find(|(value, _)| value == text).unwrap().1;
                 source_position = position("Codex").center();
+                app_position = position("Claude App").center();
                 clear_position = position("清除").center();
                 for label in [
-                    "筛选",
-                    "对话来源",
+                    "客户端",
+                    "AI 客户端",
+                    "Claude Code",
+                    "Claude App",
                     "电脑",
                     "项目",
-                    "模型",
-                    "会话类型",
-                    "原始标签",
                     "更新时间",
                 ] {
                     assert!(
@@ -404,6 +439,19 @@ mod tests {
                             .filter(|s| filters.matches(s))
                             .count(),
                         2
+                    );
+                }
+                if frame == 9 {
+                    assert!(changed);
+                    assert_eq!(filters.tool, "claude-desktop");
+                    assert_eq!(
+                        catalog
+                            .sessions
+                            .iter()
+                            .filter(|s| filters.matches(s))
+                            .count(),
+                        0,
+                        "Claude App does not include Claude Code conversations"
                     );
                 }
             }

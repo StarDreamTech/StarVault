@@ -24,6 +24,32 @@ class ResourceSourceTest(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         self.base = Path(temporary.name).resolve()
 
+    def test_unresolvable_home_reference_does_not_block_conversation_backup(self):
+        home = self.base / 'claude'
+        destination = self.base / 'archive/device-claude'
+        source = home / 'projects/demo/session.jsonl'
+        source.parent.mkdir(parents=True)
+        valid = self.base / 'reference.md'
+        valid.write_text('reference', encoding='utf-8')
+        text = f'[旧文件](~starvault-missing-user/log.txt)\n[参考]({valid})\n保留正文'
+        source.write_text(json.dumps({'type': 'user', 'message': {'role': 'user', 'content': text}}) + '\n',
+                          encoding='utf-8')
+        expand = Path.expanduser
+
+        def expanduser(path):
+            if str(path).startswith('~starvault-missing-user'):
+                raise RuntimeError('Cannot determine home directory')
+            return expand(path)
+
+        with patch.object(Path, 'expanduser', expanduser), patch('vault.metadata', return_value={}):
+            result = vault.export('claude', home, destination)
+            again = vault.export('claude', home, destination)
+        self.assertEqual(result['sessions'], 1)
+        self.assertEqual(again['changed_sessions'], 0)
+        manifest = resources.read(next((destination.parent / 'records').glob('*/*/manifest.json')))
+        self.assertIn(str(valid), [item['source'] for item in manifest['files']])
+        self.assertIn(text, next(destination.glob('sessions/**/*.md')).read_text(encoding='utf-8'))
+
     def fixture(self, name='archive', suffix='.jsonl', source_copy=True):
         root = self.base / name
         (root / BRANCH).mkdir(parents=True)

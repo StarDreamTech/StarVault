@@ -26,6 +26,7 @@ for pattern in ('desktop/Cargo.*', 'desktop/build_macos.py', 'desktop/src/*.rs',
                 'assets/share/*.png', 'assets/share/catalog.json',
                 'skills/use-chat-history-vault/SKILL.md', 'skills/use-chat-history-vault/agents/*.yaml',
                 '.agents/skills/chat-history-vault/SKILL.md', '.agents/skills/chat-history-vault/agents/*.yaml',
+                '.agents/skills/chat-history-vault/references/*.md',
                 '.github/workflows/*.yml', 'docs/*.md', 'tools/*.py', 'tools/*.swift'):
     paths.update(root.glob(pattern))
 for path in sorted(paths):

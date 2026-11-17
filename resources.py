@@ -42,6 +42,8 @@ def write(path, value):
 
 def policy(root):
     root = Path(root).resolve()
+    if read(archive_api.safe_path(root, '.import-policy.json'), {}).get('text_only') is True:
+        return set()
     path = archive_api.safe_path(root, '.migration.json')
     return set(read(path, {}).get('kinds', ['images'])) & set(KINDS)
 
@@ -52,6 +54,8 @@ def save_policy(root, kinds):
     kinds = set(kinds)
     if kinds - set(KINDS):
         raise ValueError('Unknown attachment kinds: ' + ','.join(sorted(kinds - set(KINDS))))
+    if kinds and read(archive_api.safe_path(root, '.import-policy.json'), {}).get('text_only') is True:
+        raise ValueError('当前为仅文本导入模式，请先在增量导入中关闭“仅保存文本”')
     path = archive_api.safe_path(root, '.migration.json')
     write(path, {'kinds': sorted(kinds)})
     return {'kinds': sorted(kinds), 'settings_only': True}
@@ -89,11 +93,12 @@ def collect(value, cwd, ordinal, refs):
             original = name
             name = urllib.parse.unquote(name.removeprefix('file://'))
             name = re.sub(r':\d+(?::\d+)?$', '', name)
-            path = Path(name).expanduser()
-            if not path.is_absolute():
-                if not cwd: continue
-                path = Path(cwd) / path
-            try: path = path.resolve()
+            try:
+                path = Path(name).expanduser()
+                if not path.is_absolute():
+                    if not cwd: continue
+                    path = Path(cwd) / path
+                path = path.resolve()
             except (OSError, RuntimeError, ValueError): continue
             # Credentials are not conversation attachments, even when a command mentions them.
             if path.name in ('auth.json', 'credentials.json', '.env') or any(p in path.parts for p in ('.ssh', '.aws')): continue
@@ -195,6 +200,8 @@ def manifests(root, branch=None, session=None):
 
 def source_path(root, manifest, data):
     """Archive copies move with their manifest, even when an old absolute path still exists."""
+    if data.get('metadata', {}).get('source_retained') is False and data.get('metadata', {}).get('text_only') is True:
+        return archive_api.safe_path(root, f'records/{data["branch"]}/{data["session_id"]}/source.jsonl')
     relative = data.get('metadata', {}).get('source_copy')
     if relative is not None:
         return archive_api.safe_path(root, relative)

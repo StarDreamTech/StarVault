@@ -11,6 +11,7 @@ import unittest
 from unittest.mock import patch
 
 import claude_desktop
+import archive_storage
 import resources
 import vault
 
@@ -43,6 +44,24 @@ def session(home, account='account/org', source='claude-ai-chat', staged=False):
 
 
 class ClaudeDesktopTest(unittest.TestCase):
+    def test_text_import_reads_the_plain_transcript_without_a_full_snapshot(self):
+        with tempfile.TemporaryDirectory() as temporary, contextlib.redirect_stdout(io.StringIO()):
+            root = Path(temporary)
+            home, destination = root / 'Claude-3p', root / 'backup/device-claude-desktop'
+            source, _ = session(home)
+            original = source.read_bytes()
+            destination.parent.mkdir()
+            archive_storage.save_preferences(destination.parent, ['claude-desktop'])
+            with patch('vault.prepare_jsonl', side_effect=AssertionError('No temporary source copy')):
+                self.assertEqual(vault.export('claude-desktop', home, destination)['changed_sessions'], 1)
+                self.assertEqual(vault.export('claude-desktop', home, destination)['changed_sessions'], 0)
+            row = next(iter(vault.read_json(destination / 'index.json')['sessions'].values()))
+            self.assertEqual(source.read_bytes(), original)
+            self.assertIn('Fixture chat', (destination / row['file']).read_text())
+            manifest = vault.read_json(destination.parent / row['local_record'])
+            self.assertFalse(manifest['metadata']['source_retained'])
+            self.assertFalse(any(destination.parent.rglob('source.jsonl')))
+
     def test_export_preserves_sources_and_refreshes_only_changed_metadata(self):
         with tempfile.TemporaryDirectory() as temporary, contextlib.redirect_stdout(io.StringIO()):
             root = Path(temporary)

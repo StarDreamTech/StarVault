@@ -2,6 +2,7 @@
   "private": true,
   "scripts": {
     "preview": "cargo run --release --locked --manifest-path desktop/Cargo.toml --",
-    "preview:timeline": "cargo run --release --locked --manifest-path desktop/Cargo.toml -- --timeline"
+    "preview:timeline": "cargo run --release --locked --manifest-path desktop/Cargo.toml -- --timeline",
+    "preview:migration": "cargo run --release --locked --manifest-path desktop/Cargo.toml -- --migration"
   }
 }

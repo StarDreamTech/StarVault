@@ -30,6 +30,15 @@ fn node(timestamp: &str, kind: &str, message_index: usize) -> timeline::Node {
 }
 
 #[test]
+fn timeline_navigation_can_render_while_the_background_scan_is_pending() {
+    let catalog = Catalog {
+        sessions: vec![session("mac-codex", "a", None, "/a")],
+        ..Default::default()
+    };
+    assert!(timeline_entries(&catalog, &[0], "", false).is_empty());
+}
+
+#[test]
 fn timeline_orders_instants_across_timezones_and_keeps_unknown_times_last() {
     let catalog = Catalog {
         sessions: vec![session("mac-codex", "a", None, "/a")],

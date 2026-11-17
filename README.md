@@ -4,11 +4,11 @@
 
 **[项目介绍 / Project site](https://stardreamtech.github.io/projects/starvault/)**
 
-星匣把分散的 AI 对话、附件与 Skill 收进自己的长期档案，方便检索、回溯和换机迁移，也为更懂你的助手准备有出处的历史资料。
+星匣帮助你在换电脑、离职交接时，带走自己的 AI 聊天记录。把本机已有记录收集成可搜索、可阅读的档案，再导出到移动硬盘，在新电脑直接打开；图片、附件与 Skill 按需保存。
 
 产品原名为 Chat History Vault（会话档案）。软件代码发布于 [StarDreamTech/starvault](https://github.com/StarDreamTech/starvault)，聊天备份使用用户自行配置的私有仓库。`starvault` 与 `chat-history-vault` 命令均可使用；Python 模块、MCP 服务标识、Skill 标识和数据目录保持兼容。
 
-桌面主窗口右上角的 GitHub 图标打开软件的公开源码仓库，不是聊天备份仓库。「管理 → 关于与反馈」（或设置中的同名分类）提供仓库及问题反馈链接；反馈公开，请勿上传私人对话、附件或凭据。
+桌面右上角“设置与帮助 → 查看软件源码”打开软件的公开源码仓库。“关于与反馈”提供仓库及问题反馈链接；反馈公开，请勿上传私人对话、附件或凭据。
 
 <p align="center"><img src="assets/starvault-256.png" width="128" alt="星匣 StarVault 图标：星星落入匣子"></p>
 
@@ -28,7 +28,7 @@ open -a StarVault
 
 新版 Homebrew 若提示未信任此安装源，核对 [Formula / Cask](https://github.com/cpython666/homebrew-tap) 后，可仅信任本产品：`brew trust --formula cpython666/tap/starvault` 和 `brew trust --cask cpython666/tap/starvault`，再继续安装。
 
-把 Codex、Claude Code、Claude Desktop、WorkBuddy、OpenClaw、DeepSeek Harness 的本地会话及导入的 ChatGPT 对话备份为可阅读、可筛选的档案。Claude Desktop 包括已经保存在本地的云端聊天导入副本，以及 Code Projects 的本地缓存消息。**GitHub 只上传对话正文与分类索引；原始消息记录、附件、命令和日志留在本地。**
+把 Codex、Claude Code、Claude App、WorkBuddy、OpenClaw、DeepSeek Harness 的本地会话及导入的 ChatGPT 对话备份为可阅读、可筛选的档案。Claude App 包括已经保存在本地的普通聊天副本、导入的 Code 会话和 Projects 缓存消息。**GitHub 只上传对话正文与分类索引；原始消息记录、附件、命令和日志留在本地。**
 
 - 软件仓库的 `main`：工具代码；以下会话分支创建在独立配置的私有备份仓库中。
 - `<电脑名称>-codex`：这台电脑的 Codex CLI 文字会话和索引。
@@ -41,7 +41,7 @@ open -a StarVault
 - 本地 `images/`：按图片内容 SHA-256 去重的 PNG/JPEG/GIF/WebP 原始文件，不压缩、不上传。
 - 本地 `attachments/`：可选复制的 GLB、Blend、文档、代码等，按内容去重并保留旧版本。
 - 本地 `skills/`：Skill 完整目录的 ZIP 快照、来源和历史版本；仅保存在本地。
-- 本地 `records/<电脑-工具>/<会话>/`：原始对话 JSONL、原始元数据、文件关联清单及可选的命令日志；Claude Desktop 本地 JSONL 会话 / OpenClaw / DeepSeek Harness 另存完整事件流 `source.jsonl`，Code Projects 保存提取并合并的消息快照，压缩 Codex 会话保留原始压缩副本 `source.jsonl.zst`。
+- 本地 `records/<电脑-工具>/<会话>/`：对话 JSONL、原始元数据、文件关联清单及可选的命令日志。仅文本导入不保存完整事件快照和资源二进制；Projects 保留 `project-state.jsonl` 中的文字版本与关系，供缓存消失后继续合并。另选完整事件快照时，Claude App 本地会话 / OpenClaw / DeepSeek Harness 保存 `source.jsonl`，压缩 Codex 保存 `source.jsonl.zst`。
 
 依赖：Python 3.9+；备份需要 Git，私有仓库同步需要 GitHub 登录。无必装的第三方 Python 包，无需 Git LFS 或数据库服务。读取 Codex、DeepSeek Harness 或 OpenClaw 中的 zstd 压缩内容时，按顺序使用 Python 3.14+ 标准库、可选的 `zstandard`、系统或 Homebrew 的 libzstd、`zstd` 命令之一；都没有时该来源会报告无法读取，不会静默跳过。
 
@@ -75,6 +75,12 @@ py -3 -m venv .venv
 ```sh
 # 备份与迁移沿用原参数；init 见“一台新电脑的设置”
 chat-history-vault export                   # 仅本地备份
+chat-history-vault import-local --archive /path/to/backup --tools codex,claude-desktop  # 手动增量导入，默认仅文本，不需要 Git
+chat-history-vault import-local --archive /path/to/backup --tools codex --resource-kinds images,documents  # 只另存所选附件，不附带完整快照
+chat-history-vault transfer-archive --archive /path/to/backup --plan  # 检查已有档案与导出大小
+chat-history-vault transfer-archive --archive /path/to/backup --destination /path/to/drive  # 在该父目录中新建可带走的档案文件夹
+chat-history-vault cleanup-text --archive /path/to/backup --plan  # 只估算可释放的归档副本空间
+chat-history-vault cleanup-text --archive /path/to/backup         # 清理资源副本，保留文字；不修改源应用文件
 chat-history-vault sync --tool codex        # 会提交并推送到已配置的私有仓库
 chat-history-vault attachment-policy --kinds none   # 后续只备份会话，不另行复制附件
 chat-history-vault attachment-policy --kinds images # 后续同时复制图片
@@ -102,33 +108,48 @@ chat-history-vault skill-path
 
 `desktop/` 是 Rust + egui 编写的原生桌面阅读器，直接读取同一份本地备份，不需要启动网页服务器。支持：
 
-- 筛选、项目/会话列表、时间线/正文三栏布局，浅色工具栏与低饱和侧栏，保留金色星匣标记。来源按行左对齐，显示会话数量；筛选栏和列表分别调整宽度、独立滚动，窄窗口为正文保留阅读空间。
+- 默认打开“聊天档案”，以客户端、会话列表、聊天内容三栏阅读；顶部“增量导入”和“备份与迁移”保留快捷入口。迁移页按“收集本机记录 → 导出档案文件夹 → 新电脑打开已有档案”三步操作，展示当前档案及导出结果；存储空间、图片附件和 Skill 收进辅助入口。
+- 聊天档案保留筛选、项目/会话列表、时间线/正文三栏布局，浅色工具栏与低饱和侧栏，保留金色星匣标记。来源按行左对齐，显示会话数量；筛选栏和列表分别调整宽度、独立滚动，窄窗口为正文保留阅读空间。
 - 全文搜索常驻会话栏顶部，多个关键词同时匹配；macOS 按 `Cmd+K`、Windows/Linux 按 `Ctrl+K` 聚焦搜索框。
-- 最左侧常驻筛选栏，直接点选对话来源（Codex / Claude / Claude Desktop / WorkBuddy / OpenClaw / DeepSeek Harness / ChatGPT）和更新时间；电脑、项目、模型、会话类型、原始标签的下拉框持续可见。已选条件显示在栏内“已筛选”区域，点击条件可单独移除；顶部“清除”保留搜索文字和归档标签页。
+- 最左侧常驻筛选栏，直接点选对话来源（Codex / Claude Code / Claude App / WorkBuddy / OpenClaw / DeepSeek Harness / ChatGPT）和更新时间；六类本地客户端始终分别显示，即使暂时没有归档；ChatGPT 在已有导入记录时显示。电脑和项目常驻，模型、会话类型、原始标签放在“更多筛选”。已选条件显示在栏内“已筛选”区域，点击条件可单独移除；顶部“清除”保留搜索文字和归档标签页。
 - “最近 / 项目分组 / 时间线”切换；项目可展开查看所属会话，Codex 置顶项目和置顶会话优先显示。各视图都保留“未归档 / 已归档 / 全部”标签页。
+- Claude App Projects 按项目昵称导航，在项目分组列表顶部单独展示，与普通工作目录项目分节。中间保留主对话，右侧独立面板显示可搜索的讨论串列表或所选讨论正文；双栏独立滚动、可调宽，支持关闭讨论及整栏展开，窄窗口自动切换单栏。主对话保留来源明确标记的消息顺序，可打开对应讨论串及跨串引用，并返回根消息。只有主对话、没有讨论的消息不会占一个讨论串入口；缺少正文的讨论不伪造内容。
+- 项目昵称及讨论串标题可从本地保存的 Claude 导航记录恢复，讨论串标题也可读取已缓存的启动事件；退出登录和缓存清理后保留已恢复名称。尚未找回的项目名显示“未命名项目 · 频道末八位”，状态为最后观察值，不根据会话标题猜测项目名或备注。
+- Projects 的主对话和讨论串共用根消息身份，项目时间线去重后跳到准确原文；不同频道、客户端产品和电脑的同名内容保持隔离。旧缓存归档可增量升级，缓存消失后保留已观察到的历史。当前仅支持已验证的本地缓存消息格式，不代表全账号或完整 Projects 历史。
+- Codex / Claude Code 可从正文顶部跳到上级会话，主会话的“关联会话”列出子 Agent 与分叉；Codex 分叉也显示“分叉自”。只使用源记录中明确的关系，同一电脑和来源内导航；未导入上级时显示缺失提示。旧归档在下次手动增量导入可用来源后补充这些关系。
 - 项目时间线汇总同一项目的多段会话，按“需求、决定、成果、问题、修复”整理关键节点。可按节点类型筛选、切换时间顺序，并通过“查看原对话”定位到对应消息；左侧会话筛选同样生效。
 - Markdown 阅读、代码块、表格、本地原图；图文/纯文字切换。
 - 同一轮有多条助手回复时，默认保留最后一条，较早的回复收进“展开过程回复”；用户问题保持展示，展开后按原顺序查看。这里直接展示已有回复，不生成新的总结；复制全文仍包含全部原文，时间线定位到折叠回复时会自动展开。
 - 紧凑左对齐会话列表与居中限宽正文；已归档会话在标题右侧显示线框归档图标，悬停可查看状态。真实提问使用靠右的浅灰气泡，助手按来源名称连续排版，保留本地时间与单条原文复制。纯环境上下文和项目说明默认折叠，混有实际问题的消息保持展开；原始 Markdown 保持不变。
 - Claude 原始消息中确认的 `isMeta` 注入内容按“Agent 协作”“Skill”或“会话上下文”折叠，工具截图另列为关联图片；完整原文可以展开查看。完整 `<wake>` 通知中的单条人类提问直接显示正文，包装保留在“消息来源”中。原始记录缺失或不能与正文对应时保留普通阅读，不按消息位置猜测分类。
-- 备份文件夹入口固定在会话栏底部；长筛选值、项目名和会话标题单行省略，悬停可查看全文。窄窗口自动限制列表宽度，为正文保留阅读空间。
+- 会话栏底部固定“备份与迁移”入口，档案位置可在迁移首页查看；长筛选值、项目名和会话标题单行省略，悬停可查看全文。窄窗口自动限制列表宽度，为正文保留阅读空间。
 - 被环境标签或项目说明占据的会话标题，优先显示首条真实用户请求；原始标题仍可在阅读栏“更多 → 会话信息”中查看。环境上下文展开后显示工作目录、终端、日期、时区等字段，完整标签保留在“查看原文”中，可单独复制。
 - 图片默认以不超过 320 × 240 的圆角缩略图显示，保持比例、不裁切；点击弹出预览，可适应窗口、查看原尺寸或缩放，Esc / 点击遮罩关闭。
-- 顶部保留“刷新”“导入 ChatGPT”和“管理”；“管理”菜单集中提供“附件与迁移”“Skill 备份与恢复”“设置”和“选择备份目录…”入口。
+- “收集本机记录”提供六种本地来源多选，先选择再手动执行，默认仅保存文本；Claude App 包含普通聊天、Code 导入副本与 Projects。ChatGPT 的 JSON / ZIP 导入位于收集窗口“从导出文件补充（可选）”，只在手上已有导出文件时需要，不扫描本机应用或登录账号。会话栏 `↻` 只重读档案。
+- “存储空间”可先估算、再确认清理 StarVault 资源副本，保留文字及 Projects 增量状态；不会改动原应用文件。开启仅文本不会自动删除已有副本。
 - 设置采用左侧分类导航、右侧内容布局；“图片显示”“分享软件”固定在左侧，右侧长内容独立滚动。
 - 阅读栏“更多 → 复制完整对话”复制全文；“更多 → 定位会话文件”打开会话文件所在位置。“附件与活动”进入当前会话的附件、工具日志与原文面板。
-- “管理 → Skill 备份与恢复”：从默认或自定义目录收集 Skill，估算空间、增量备份，或恢复到指定文件夹。
-- “管理 → 设置 → 图片显示”可调整缩略图大小，或独立选择图片文件夹：粘贴路径或浏览文件夹，再点击“应用并预览”。默认使用备份下的 `images/`，也可以指定外置盘里的图片目录。设置保存在本机，重启后继续使用。
+- “备份与迁移 → Skill 备份与恢复”：从默认或自定义目录收集 Skill，估算空间、增量备份，或恢复到指定文件夹。
+- “设置与帮助 → 图片显示设置”可调整缩略图大小，或独立选择图片文件夹：粘贴路径或浏览文件夹，再点击“应用并预览”。默认使用备份下的 `images/`，也可以指定外置盘里的图片目录。设置保存在本机，重启后继续使用。
 - 空状态分别提示正在载入、筛选无匹配和新档案尚无会话，提供对应的筛选清除或备份目录选择入口。
 - 每分钟刷新索引；图片按需加载，切换会话后释放上一会话的图片缓存。
 
-浏览和迁移均不修改原始聊天，不执行历史命令。“管理 → 附件与迁移”只调用本机备份工具复制所选文件，“导入 ChatGPT”只进行本地导入；后续定时同步才上传对话文字。`--check` 可以无窗口验证备份索引。
+浏览和迁移均不修改原始聊天，不执行历史命令。“备份与迁移 → 图片与附件”调用本机备份工具复制所选文件，ChatGPT 导入只进行本地处理。收集与档案导出不需要 GitHub、不上传、不创建自动任务；`sync` 是另外的显式操作。`--check` 可以无窗口验证备份索引。
+
+换机时，先点击“检查档案并准备导出”查看范围和大小，再选一个保存位置。星匣会新建独立文件夹，复制已收集的各来源文字、原文清单、已有图片附件和 Skill 版本；不受阅读筛选影响，也不补取源应用。导出排除 Git 历史、本机配置与缓存，失败不发布半成品，不覆盖当前档案。将整个导出文件夹拷到新电脑，在“打开已有档案”中选择它即可；无需解压或重新登录原账号。这是可检索阅读的归档，不会把聊天恢复进原客户端继续对话。
+
+手动导入会在归档根目录保存 `.import-policy.json`（来源、仅文本、完整快照、手动模式）。之后 `all` 遵守所选来源，`export` / MCP 显式备份继续增量导入；`sync` 在手动模式下只同步已有文字，不扫描或复制源应用数据，也不自动备份 Skill。仅文本模式下自动附件偏好不生效，显式附件迁移仍须由用户发起。收集窗口提供“仅文字 / 自选附件”，图片、文档、代码、模型、日志和其他附件独立选择。CLI 用 `--resource-kinds images,documents` 只复制所选类型，另加 `--source-snapshots` 才保留完整事件快照；日志提取需要完整快照，会一并启用并在界面说明。旧参数 `--with-resources` 继续兼容完整快照及既有附件偏好。旧档案未选择新模式时保持既有导出行为。
+
+不保留完整快照时，未压缩的 Claude App 本地会话与 DeepSeek Harness 直接读取 JSONL，减少完整源文件的临时复制；源在读取期间发生变化时保留已有归档并提示重试。增量检测也会检查文件身份及状态变化，识别同尺寸且恢复修改时间的替换；变化的会话仍完整解析，不是只读取新增尾部。切换到仅文字复用未变化的旧档案，不删除已有资源或快照。导入显示当前来源、阶段、更新数和运行耗时；普通聊天启动不等待时间线整理，时间线在打开时后台增量生成。
+
+清理只删除归档中已识别的 `source.jsonl*` 和按哈希命名的图片 / 附件对象；清理前校验全部文字、会话身份、目录边界及 Projects 状态，缺失、损坏或链接目录会阻止清理。文字与项目状态先保留，再删除副本，支持中断后重试。仅存在于这些副本中的资源清理后不能从 StarVault 恢复，图片引用和文件来源关联仍保留。
 
 开发与预览在 `starvault` 软件仓库中进行，`chat-history-vault` 私有仓库用于聊天备份。软件仓库根目录提供以下快捷命令（需要 Rust 和 npm，无需安装 npm 依赖）：
 
 ```sh
 npm run preview           # 编译并启动当前 StarVault 源码
 npm run preview:timeline  # 编译并启动，直接进入时间线页面
+npm run preview:migration # 编译并启动，直接进入备份与迁移首页
 ```
 
 快捷命令调用 Cargo，读取已配置的本地归档；不会触发源会话导出或备份同步。
@@ -162,7 +183,7 @@ cargo run --release --locked -- --archive /path/to/backup --check
 
 ## 分享星匣
 
-“管理 → 设置 → 分享软件”提供中英文宣传文案和产品图片，也可从“管理 → 分享软件”直接打开。两类文案为简短推荐 / 产品介绍，三组图片为产品总览 / 换机与数据自主 / 为 AI 准备历史。切换语言保留当前主题。可复制文案与项目链接、复制系统图片、保存原始 PNG；点击预览图可放大。素材全部为固定原创样例，与本地聊天记录独立。
+“设置与帮助 → 分享星匣”提供中英文宣传文案和产品图片。两类文案为简短推荐 / 产品介绍，三组图片为产品总览 / 换机与数据自主 / 为 AI 准备历史。切换语言保留当前主题。可复制文案与项目链接、复制系统图片、保存原始 PNG；点击预览图可放大。素材全部为固定原创样例，与本地聊天记录独立。
 
 | 主题 | 中文素材 | English |
 | --- | --- | --- |
@@ -178,13 +199,13 @@ cargo run --release --locked -- --archive /path/to/backup --check
 | --- | --- | --- | --- |
 | Codex | `~/.codex/sessions`、`archived_sessions` | `.jsonl`、`.jsonl.zst`、`.jsonl.zstd` | 普通 JSONL 直接读取；压缩会话另存原始压缩副本 `source.jsonl.zst` |
 | Claude Code | `~/.claude/projects` | JSONL | 直接读取源文件，不修改 |
-| Claude Desktop | 平台 Claude / Claude-3p 数据目录中的 `local-agent-mode-sessions`、`claude-code-sessions`、`Cache/Cache_Data` | 现有 JSONL + 会话元数据；白名单 Code Projects 消息缓存 | 本地 JSONL 会话及已有导入副本另存 `source.jsonl`；缓存消息保存合并快照，不请求云端导出 |
+| Claude Desktop | 平台 Claude / Claude-3p 数据目录中的 `local-agent-mode-sessions`、`claude-code-sessions`、`Cache/Cache_Data`、`Session Storage` | 现有 JSONL + 会话元数据；白名单 Code Projects 消息缓存与项目导航名称 | 本地 JSONL 会话及已有导入副本另存 `source.jsonl`；缓存消息保存合并快照，不请求云端导出 |
 | WorkBuddy | `~/.workbuddy-ai/projects/*/*.jsonl`；`workbuddy.db` 提供标题、工作目录和模型 | JSONL + SQLite | 源 JSONL 原样保留；上下文包装仍写入 `dialogue.jsonl`，剪贴板图片复制到 `images/` |
 | OpenClaw | `~/.openclaw/agents/*/agent/openclaw-agent.sqlite` | SQLite `transcript_events` | 事件流写入 `records/<电脑>-openclaw/<会话>/source.jsonl` |
 | DeepSeek Harness | `~/.dsh/sessions/<项目>/<会话>/session*.jsonl` 及 `.zst` / `.zstd` 版本 | JSONL 或 zstd 压缩 JSONL | 解压后的事件流写入 `records/<电脑>-dsh/<会话>/source.jsonl` |
 | ChatGPT | 导入的 `conversations.json` / ZIP / 快照 | JSON | 导入缓存与替代分支保留在本地 |
 
-Claude Desktop 默认目录为 macOS 的 `~/Library/Application Support/Claude`、Windows 的 `%APPDATA%/Claude`（未设置时使用 `~/AppData/Roaming/Claude`）、Linux 的 `$XDG_CONFIG_HOME/Claude`（未设置时使用 `~/.config/Claude`），同时检查同级 `Claude-3p`。可用 `init --claude-desktop-home /path/to/Claude` 配置；未配置时采用 `CLAUDE_DESKTOP_HOME` 或上述默认位置。在这些根目录中扫描两类会话目录和 `Cache/Cache_Data`；缓存只读提取白名单 Code Projects 消息响应，不复制 HTTP 元数据、登录凭据或整个浏览器缓存。
+Claude Desktop 默认目录为 macOS 的 `~/Library/Application Support/Claude`、Windows 的 `%APPDATA%/Claude`（未设置时使用 `~/AppData/Roaming/Claude`）、Linux 的 `$XDG_CONFIG_HOME/Claude`（未设置时使用 `~/.config/Claude`），同时检查同级 `Claude-3p`。可用 `init --claude-desktop-home /path/to/Claude` 配置；未配置时采用 `CLAUDE_DESKTOP_HOME` 或上述默认位置。在这些根目录中扫描两类会话目录、`Cache/Cache_Data` 和 `Session Storage`；只读提取白名单 Code Projects 消息响应及 Claude 导航中的项目/讨论名称，不复制 HTTP 元数据、登录凭据或整个浏览器缓存。
 
 该来源保留 `claude-ai-chat`、`sibling-1p-code`、`terminal-cli` 等导入标记，以及 `coverage=local_imported_copy` 或 `local_desktop_session`。已有云端导入副本不等于全部云端历史；没有正文文件的元数据不会生成空会话，定时任务也不会登录 Claude 抓取新聊天。同一个原始 ID 在不同账号或产品目录下分别归档，搬迁整个来源目录后保持 ID 稳定。macOS 本地目录已验证；Windows/Linux 默认路径有模拟测试，后端通过三平台原生 CI 临时数据回归；源应用真实数据仍需在对应系统核验。
 
@@ -196,7 +217,7 @@ WorkBuddy 每轮会把系统说明和记忆包在 `<system-reminder data-role="u
 
 ## 附件复制偏好
 
-“管理 → 附件与迁移”首先显示当前会话的附件预览：支持名称/路径搜索、类型与备份状态筛选、10 MB / 100 MB / 1 GB 大小门槛以及大文件优先排序。显示单项大小、匹配文件合计和未备份大小；未知大小单独标记。图片缩略预览支持 64–240 像素调节，点击查看大图；会话内嵌图片也会列出，与已有文件引用去重。只预览已保存的本地图片或用户明确配置的图片目录，不加载远程资源。
+“备份与迁移 → 图片与附件”首先显示当前会话的附件预览：支持名称/路径搜索、类型与备份状态筛选、10 MB / 100 MB / 1 GB 大小门槛以及大文件优先排序。显示单项大小、匹配文件合计和未备份大小；未知大小单独标记。图片缩略预览支持 64–240 像素调节，点击查看大图；会话内嵌图片也会列出，与已有文件引用去重。只预览已保存的本地图片或用户明确配置的图片目录，不加载远程资源。
 
 列表筛选只控制当前会话的预览；实际复制按面板下方选择的文件类型与会话范围执行，精确新增空间需先估算。“选择类型与后续备份偏好”提供“仅会话”“会话和图片”“所有关联文件”预设，也可以勾选图片、模型、文档、代码、命令日志和其他附件。默认复制图片，其他文件按需选择。点击“保存后续备份偏好”只保存设置；关闭某种类型后，后续备份停止复制该类型，已有副本继续保留。
 
@@ -221,7 +242,7 @@ ChatGPT 快照显示覆盖范围标记，接口缺少模型等字段时保留为
 
 ## 按空间选择本地附件
 
-点击“管理 → 附件与迁移”，勾选图片、GLB / Blender、文档、代码、命令 / 日志、其他附件，可选择当前会话或全部会话。先“估算空间”，再“增量复制到备份目录”。对全部会话勾选“后续定时备份也复制所选类型”，会把选择保存在本地 `.migration.json`；默认只复制图片。
+点击“备份与迁移 → 图片与附件”，勾选图片、GLB / Blender、文档、代码、命令 / 日志、其他附件，可选择当前会话或全部会话。先“估算空间”，再“增量复制到备份目录”。对全部会话勾选“后续定时备份也复制所选类型”，会把选择保存在本地 `.migration.json`；默认只复制图片。
 
 清单记录原路径、消息序号、文件类型、大小、复制路径和 SHA-256；命令日志记录源 JSONL 的字节位置、记录序号、时间及调用 ID，按需提取为 `operations.jsonl`。文件未复制时仍保留关联，源文件失效时会标明不可用。重复文件复用内容哈希，修改后的文件产生新副本，旧副本保留。只处理会话中能识别的文件引用，不递归复制项目，也不保证收集到 Blender 的所有外部依赖。
 
@@ -238,7 +259,7 @@ python3 vault.py migrate --kinds images,models,logs --remember
 
 ## Skill 收集与跨电脑恢复
 
-点击“管理 → Skill 备份与恢复”，默认收集以下目录内包含 `SKILL.md` 的 Skill 包：
+点击“备份与迁移 → Skill 备份与恢复”，默认收集以下目录内包含 `SKILL.md` 的 Skill 包：
 
 - Codex：`~/.codex/skills`，优先使用本工具已配置的 `codex_home`，否则采用 `CODEX_HOME`。
 - Claude：`~/.claude/skills`，优先使用已配置的 `claude_home`，否则采用 `CLAUDE_CONFIG_DIR`。

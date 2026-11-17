@@ -25,7 +25,8 @@ class CliTest(unittest.TestCase):
         source = Path(__file__).resolve().parent
         for name in ('chat_history_vault.py', 'vault.py', 'vault_mcp.py', 'archive_api.py',
                      'resources.py', 'skills_backup.py', 'chatgpt_import.py', 'claude_desktop.py',
-                     'claude_cache.py', 'claude_projects.py'):
+                     'claude_cache.py', 'claude_projects.py', 'claude_project_names.py', 'archive_storage.py',
+                     'session_relations.py', 'archive_transfer.py'):
             shutil.copy2(source / name, self.code / name)
         shutil.copytree(source / 'skills/use-chat-history-vault', self.code / 'skills/use-chat-history-vault')
         self.archive = self.base / '档案 backup'
@@ -92,6 +93,44 @@ class CliTest(unittest.TestCase):
         self.assertEqual(skill, self.code / 'skills/use-chat-history-vault')
         self.assertTrue((skill / 'agents/openai.yaml').is_file())
         self.assertFalse(self.config.exists())
+
+    def test_transfer_archive_command_checks_and_exports_a_readable_folder(self):
+        plan = self.query('transfer-archive', '--plan')
+        self.assertTrue(plan['plan'])
+        destination = self.base / '带走'
+        destination.mkdir()
+        result = self.query('transfer-archive', '--destination', destination)
+        copied = Path(result['destination'])
+        self.assertEqual((copied / self.branch / 'sessions/示例项目' / (self.sid + '.md')).read_text(), self.body)
+        self.assertEqual(json.loads((copied / '.import-policy.json').read_bytes())['manual_only'], True)
+
+    def test_manual_import_copies_only_selected_kinds_without_a_full_snapshot(self):
+        import base64
+        from test_archive_storage import PNG
+        # A local DSH transcript exercises the same CLI used by the desktop without native app access.
+        dsh = self.base / 'dsh'
+        transcript = dsh / 'sessions/project/session-fixture/session.jsonl'
+        transcript.parent.mkdir(parents=True)
+        image = 'data:image/png;base64,' + base64.b64encode(PNG).decode()
+        transcript.write_text(json.dumps({'type': 'user/message', 'data': {'content': [
+            {'type': 'text', 'text': 'Original question'}, {'type': 'image', 'url': image}],
+            'source': {'kind': 'user'}}}) + '\n')
+        self.command('init', '--repo', 'https://github.com/example/private', '--archive', self.archive,
+                     '--device', 'test-machine', '--dsh-home', dsh)
+        args = ('import-local', '--archive', self.archive, '--tools', 'dsh', '--resource-kinds', 'images')
+        output = self.command(*args)
+        lines = [json.loads(line) for line in output.stdout.splitlines() if line.startswith('{')]
+        result = lines[-1]
+        self.assertTrue(lines[0]['progress'])
+        self.assertEqual(result['kinds'], ['images'])
+        self.assertFalse(result['source_snapshots'])
+        self.assertEqual(result['changed_sessions'], 1)
+        self.assertTrue(any((self.archive / 'images').iterdir()))
+        self.assertFalse(list((self.archive / 'records/test-machine-dsh').rglob('source.jsonl')))
+        self.assertEqual(json.loads(self.command(*args).stdout.splitlines()[-1])['changed_sessions'], 0)
+        previous = (self.archive / '.import-policy.json').read_bytes()
+        self.command('import-local', '--archive', self.archive, '--tools', 'dsh', '--resource-kinds', 'unknown', success=False)
+        self.assertEqual((self.archive / '.import-policy.json').read_bytes(), previous)
 
     def test_native_queries_preserve_utf8_filters_and_character_pagination(self):
         found = self.query('search', '迁移 windows', '--tool', 'codex', '--project', '示例',

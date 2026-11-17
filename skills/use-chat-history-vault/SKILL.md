@@ -51,7 +51,7 @@ Claude Code Projects 也归入 `claude-desktop`，标记 `source=code-projects-c
 
 Codex 与 DeepSeek Harness 的 `.zst` / `.zstd` 记录依赖可用的 zstd 解码器；无法解码或记录损坏时报告来源错误，保留旧会话快照，不把失败称为迁移完成。OpenClaw 日志包含工具调用和结果，SQLite WAL 中的更新也参与增量检测。
 
-搬迁应复制整个备份目录。清单中的相对 `source_copy` 可在新位置定位已有源副本，压缩源也能用于后续日志提取；未保存完整源副本的普通 JSONL 来源，需要在旧电脑先迁移所需日志。缺失文件不能仅凭原路径恢复。Python 后端已通过 macOS/Windows/Linux 的 CI 临时数据回归；源应用真实数据读取和桌面安装包目前只在 macOS 核验。
+搬迁优先用 `starvault transfer-archive --archive /path/to/backup --plan` 检查范围与大小，再以 `--destination /path/to/drive` 代替 `--plan` 执行。实际新文件夹由返回结果确定；只复制星匣已有档案、资源与 Skill，排除 Git、本机配置和缓存，不扫描原应用。新电脑在“备份与迁移 → 打开已有档案”选择整个导出文件夹；这是检索阅读档案，不恢复原客户端续聊。也可手动复制整个备份目录。清单中的相对 `source_copy` 可在新位置定位已有源副本，压缩源也能用于后续日志提取；未保存完整源副本的普通 JSONL 来源，需要在旧电脑先迁移所需日志。缺失文件不能仅凭原路径恢复。Python 后端已通过 macOS/Windows/Linux 的 CI 临时数据回归；源应用真实数据读取和桌面安装包目前只在 macOS 核验。
 
 默认服务仅提供查询与估算工具。需要备份或恢复时，服务启动参数须包含 `--allow-write`；单次 CLI `call` 调用也使用该开关。若服务尚未启用，指出缺少的配置，不自行修改全局客户端设置。用户已授权本次备份或迁移且写入工具可用时继续执行，无需重复确认。
 
@@ -60,3 +60,7 @@ Codex 与 DeepSeek Harness 的 `.zst` / `.zstd` 记录依赖可用的 zstd 解�
 这些 MCP 写入操作仅更新本地备份，不提供 GitHub 推送。`dialogue` 是归档保存的原始消息表示，内嵌图片可能已替换为本地引用，不能声称它是源 JSONL 的逐字节副本。档案恢复也不等于把会话导回原应用继续聊天。
 
 软件品牌为星匣 StarVault，`starvault` 和 `chat-history-vault` 均可调用。保存附件偏好不会自动开始复制，也不会删除已有副本；原始会话快照可能包含内嵌资源。补齐旧附件仍先估算空间，再执行已授权的复制。
+
+手动来源选择使用 `starvault import-local --archive /path/to/backup --tools codex,claude-desktop`，默认仅文本，不需要 Git、不上传、不自动复制 Skill；`--resource-kinds images,documents` 只复制所选附件，不附带完整源快照；`--source-snapshots` 独立启用快照，日志提取需要快照。旧 `--with-resources` 保留完整快照及既有附件偏好。仅文本策略还控制源副本发布，与 `kinds=[]` 不同。所选来源、仅文本与快照模式保存在归档 `.import-policy.json`，`all` 遵守来源选择；手动模式下 `sync` 只同步已有文字，显式 `export` / MCP 备份仍可导入。桌面默认以客户端、会话、正文三栏阅读，“增量导入”先选择六种本地来源及文字 / 附件类型再执行；ChatGPT 导出文件位于“从导出文件补充（可选）”，不作为本地扫描来源。会话栏 `↻` 只重读归档，清理位于独立的“存储空间”。
+
+需要释放空间且用户已授权清理 StarVault 副本时，先运行 `starvault cleanup-text --archive /path/to/backup --plan` 核对范围，再去掉 `--plan` 执行。清理保留 Markdown、dialogue 和 Projects 必要增量文字状态，仅删除归档已识别的完整事件快照与哈希资源对象，不触及原应用文件。仅存在于这些副本中的图片、附件和事件无法从 StarVault 恢复；引用仍保留。清理设置后续仅文本与手动模式，已有旧版定时任务应停用并保存配置，避免旧代码重新复制资源。不要自行清理源应用数据、聊天正文或未知文件。
