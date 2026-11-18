@@ -1,5 +1,7 @@
 # 星匣 · StarVault
 
+**简体中文** | [English](README.en.md)
+
 **你的 AI 记忆，始终属于你。**
 
 **[项目介绍 / Project site](https://stardreamtech.github.io/projects/starvault/)**
